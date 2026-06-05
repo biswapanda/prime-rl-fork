@@ -16,6 +16,7 @@ from verifiers.utils.serve_utils import get_free_port
 
 from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig, TrainEnvConfig
 from prime_rl.orchestrator.eval_utils import compute_pass_at_k
+from prime_rl.orchestrator.sampling import SampleStrategy, ShuffledCursorSampler
 from prime_rl.utils.logger import ProgressTracker, get_logger
 from prime_rl.utils.monitor import get_monitor
 from prime_rl.utils.utils import capitalize
@@ -170,9 +171,23 @@ class TrainEnv(Env):
     def __init__(self, config: TrainEnvConfig):
         super().__init__(config)
         self.sampling_args = config.sampling.to_sampling_args()
+        # Set by ``build_sampler`` (called by TrainSource at setup). Owns this
+        # env's dataset + selection state; reached by the sink for ``observe``.
+        self.sampler: SampleStrategy | None = None
 
     def get_dataset(self, seed: int | None = None):
         return self.env.get_dataset(seed=seed)
+
+    def build_sampler(self, *, seed: int | None) -> None:
+        """Load this env's dataset and build its default ``SampleStrategy``.
+        Each row is stamped with ``env_name`` (``example_id`` comes from the
+        dataset)."""
+        rows: list[dict] = []
+        for row in self.get_dataset(seed=seed):
+            ex = dict(row)
+            ex["env_name"] = self.name
+            rows.append(ex)
+        self.sampler = ShuffledCursorSampler(rows, seed=seed)
 
 
 class EvalEnv(Env):
