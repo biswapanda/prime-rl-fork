@@ -9,6 +9,8 @@ set -euo pipefail
 : "${DYNAMO_COMMIT:?DYNAMO_COMMIT must pin the isolated Dynamo sidecar branch}"
 : "${VLLM_COMMIT:?VLLM_COMMIT must pin the local vLLM OpenEngine branch}"
 : "${VLLM_BUNDLE_SHA256:?VLLM_BUNDLE_SHA256 must pin the transferred Git bundle}"
+: "${GITEA_USERNAME:?GITEA_USERNAME must be injected from a Kubernetes Secret}"
+: "${GITEA_PASSWORD:?GITEA_PASSWORD must be injected from a Kubernetes Secret}"
 
 PRIME_BRANCH=${PRIME_BRANCH:-bis/openengine-rl-k8s}
 DYNAMO_BRANCH=${DYNAMO_BRANCH:-bis/openengine-rl-dynamo-v2}
@@ -42,7 +44,7 @@ export GIT_TERMINAL_PROMPT=0
 
 clone_exact() {
   local repository=$1 branch=$2 commit=$3 destination=$4
-  git clone --branch "$branch" --single-branch \
+  GIT_LFS_SKIP_SMUDGE=1 git clone --branch "$branch" --single-branch \
     "$GITEA_URL/biswa/$repository.git" "$destination"
   test "$(git -C "$destination" rev-parse HEAD)" = "$commit"
   test -z "$(git -C "$destination" status --porcelain)"
@@ -51,7 +53,7 @@ clone_exact() {
 clone_exact prime-rl-2 "$PRIME_BRANCH" "$PRIME_COMMIT" "$WORK_ROOT/prime-rl"
 clone_exact dynamo2 "$DYNAMO_BRANCH" "$DYNAMO_COMMIT" "$WORK_ROOT/dynamo"
 test "$(sha256sum "$VLLM_BUNDLE" | awk '{print $1}')" = "$VLLM_BUNDLE_SHA256"
-git clone "$VLLM_BUNDLE" "$WORK_ROOT/vllm"
+GIT_LFS_SKIP_SMUDGE=1 git clone "$VLLM_BUNDLE" "$WORK_ROOT/vllm"
 git -C "$WORK_ROOT/vllm" checkout --detach "$VLLM_COMMIT"
 test "$(git -C "$WORK_ROOT/vllm" rev-parse HEAD)" = "$VLLM_COMMIT"
 test -z "$(git -C "$WORK_ROOT/vllm" status --porcelain)"
