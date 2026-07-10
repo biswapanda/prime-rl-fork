@@ -22,6 +22,7 @@ from prime_rl.utils.logger import get_logger
 NCCL_READY_MARKER = "NCCL_READY"
 ADMIN_TIMEOUT_S = 300.0
 UPDATE_WEIGHTS_TIMEOUT_S = 720.0
+NCCL_HTTP_TIMEOUT_MARGIN_S = 30.0
 DISCOVERY_REQUEST_TIMEOUT_S = 10.0
 DISCOVERY_POLL_INTERVAL_S = 1.0
 _RETRYABLE_DISCOVERY_HTTP_STATUS_CODES = frozenset({408, 409, 429})
@@ -369,6 +370,8 @@ class DynamoAdminAPI:
             raise ValueError("Cannot initialize NCCL without Dynamo workers")
         if isinstance(gpus_per_worker, bool) or gpus_per_worker < 1:
             raise ValueError("gpus_per_worker must be at least one")
+        if isinstance(timeout, bool) or timeout < 1:
+            raise ValueError("NCCL timeout must be at least one second")
         expected_world_size = len(clients) * gpus_per_worker
         world_size = expected_world_size if inference_world_size is None else inference_world_size
         if world_size != expected_world_size:
@@ -391,6 +394,7 @@ class DynamoAdminAPI:
                             "quantize_in_weight_transfer": quantize_in_weight_transfer,
                             "engine_rpc": "init_broadcaster",
                         },
+                        timeout_s=float(timeout) + NCCL_HTTP_TIMEOUT_MARGIN_S,
                     )
                     for index, client in enumerate(clients)
                 ),
