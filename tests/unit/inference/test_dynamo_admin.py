@@ -499,6 +499,30 @@ async def test_nccl_initialization_does_not_replay_ambiguous_timeout():
 
 
 @pytest.mark.asyncio
+async def test_nccl_initialization_http_timeout_wraps_engine_timeout(monkeypatch: pytest.MonkeyPatch):
+    admin = DynamoAdminAPI()
+    observed: list[float] = []
+
+    async def fake_post(_client, _method, _body=None, *, timeout_s: float, retry_transient: bool = False):
+        assert not retry_transient
+        observed.append(timeout_s)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(admin, "_post", fake_post)
+    await admin.initialize_nccl(
+        [object()],  # type: ignore[list-item]
+        host="localhost",
+        port=29511,
+        timeout=1200,
+        inference_world_size=1,
+        gpus_per_worker=1,
+        quantize_in_weight_transfer=False,
+    )
+
+    assert observed == [1230.0]
+
+
+@pytest.mark.asyncio
 async def test_nccl_initialization_rejects_world_size_that_conflicts_with_topology():
     requests = 0
 
