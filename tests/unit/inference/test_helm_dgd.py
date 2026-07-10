@@ -131,6 +131,32 @@ def test_dgd_chart_renders_generated_graph_without_inference_statefulset(tmp_pat
     assert not any(kind in rendered for kind in ("kind: ClusterRole", "kind: CustomResourceDefinition"))
 
 
+def test_dgd_chart_renders_openengine_gpu_only_on_engine_container(tmp_path: Path):
+    options = render_options(tmp_path)
+    paths = write_dgd_artifacts(
+        inference_config(engine_transport="openengine"),
+        options,
+    )
+
+    rendered = helm_template("-f", str(paths["values"]))
+    graph = rendered_resource(rendered, "DynamoGraphDeployment", "p4-math")
+
+    for service_name in ("VllmPrefillWorker", "VllmDecodeWorker"):
+        service = graph["spec"]["services"][service_name]
+        pod_spec = service["extraPodSpec"]
+        sidecar = pod_spec["mainContainer"]
+        engine = next(container for container in pod_spec["containers"] if container["name"] == "vllm-engine")
+
+        assert "resources" not in service
+        assert "resources" not in sidecar
+        assert engine["resources"] == {
+            "requests": {"nvidia.com/gpu": "1"},
+            "limits": {"nvidia.com/gpu": "1"},
+        }
+        assert sidecar["image"] == options.image
+        assert engine["image"] == options.image
+
+
 def test_external_controller_mode_renders_only_five_dgd_inference_pods(tmp_path: Path):
     paths = write_dgd_artifacts(
         inference_config(),

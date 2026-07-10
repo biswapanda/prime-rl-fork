@@ -17,6 +17,7 @@ from prime_rl.inference.dynamo import (
     build_frontend_process,
     build_worker_process,
     resolve_chat_template_content,
+    write_openengine_role_engine_configs,
     write_role_engine_configs,
 )
 
@@ -66,6 +67,17 @@ _CREDENTIAL_ENV_KEY_PATTERNS = (
     re.compile(r"(?:^|_)(?:API|ACCESS|PRIVATE|SECRET)_KEY(?:_|$)"),
 )
 MAX_RELEASE_NAME_LENGTH = 41
+OPENENGINE_RPC_PORT = 50051
+OPENENGINE_HTTP_PORT = 8100
+OPENENGINE_STARTUP_TIMEOUT_SECONDS = 1800
+OPENENGINE_SHUTDOWN_TIMEOUT_SECONDS = 120
+OPENENGINE_TERMINATION_GRACE_SECONDS = 180
+_ENGINE_CONFIG_ARTIFACT_NAMES = (
+    "prefill-engine.json",
+    "decode-engine.json",
+    "prefill-engine.yaml",
+    "decode-engine.yaml",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,14 +303,50 @@ def _resource_manifest_canonical(resource: dict[str, Any]) -> bytes:
     return _canonical_json(scoped_resource)
 
 
+def _worker_gpu_resources(service_name: str, service: dict[str, Any]) -> tuple[str, str]:
+    resources = service.get("resources")
+    resource_name = "gpu"
+    engines = [
+        container
+        for container in service.get("extraPodSpec", {}).get("containers", [])
+        if container.get("name") == "vllm-engine"
+    ]
+    if len(engines) > 1:
+        raise ValueError(f"Dynamo worker {service_name!r} must declare at most one vllm-engine")
+    if engines:
+        if resources is not None:
+            raise ValueError(
+                f"Dynamo worker {service_name!r} cannot declare both service and vllm-engine GPU resources"
+            )
+        resources = engines[0].get("resources")
+        resource_name = "nvidia.com/gpu"
+    elif resources is None:
+        raise ValueError(
+            f"Dynamo worker {service_name!r} must declare service GPU resources or exactly one vllm-engine"
+        )
+    if not isinstance(resources, dict):
+        raise ValueError(f"Dynamo worker {service_name!r} has no GPU resource contract")
+    requests = resources.get("requests", {})
+    limits = resources.get("limits", {})
+    if resource_name not in requests or resource_name not in limits:
+        raise ValueError(
+            f"Dynamo worker {service_name!r} must request and limit {resource_name!r}"
+        )
+    return str(requests[resource_name]), str(limits[resource_name])
+
+
 def _worker_topology_binding(services: dict[str, Any]) -> dict[str, Any]:
-    return {
-        service_name: {
+    def bind_worker(service_name: str, service: dict[str, Any]) -> dict[str, Any]:
+        requests_gpu, limits_gpu = _worker_gpu_resources(service_name, service)
+        return {
             "role": service["subComponentType"],
             "replicas": service["replicas"],
-            "requestsGpu": service["resources"]["requests"]["gpu"],
-            "limitsGpu": service["resources"]["limits"]["gpu"],
+            "requestsGpu": requests_gpu,
+            "limitsGpu": limits_gpu,
         }
+
+    return {
+        service_name: bind_worker(service_name, service)
         for service_name, service in sorted(services.items())
         if service["componentType"] == "worker"
     }
@@ -358,6 +406,15 @@ def _worker_service(
     engine_file: str,
 ) -> dict[str, Any]:
     assert config.deployment.type == "disaggregated"
+    if config.backend.type == "dynamo" and config.backend.engine_transport == "openengine":
+        return _openengine_worker_service(
+            config,
+            options,
+            role=role,
+            replicas=replicas,
+            config_map_name=config_map_name,
+            engine_file=engine_file,
+        )
     process = build_worker_process(
         config,
         role,
@@ -404,7 +461,152 @@ def _worker_service(
     }
 
 
-def _add_pvc(resource: dict[str, Any], service: dict[str, Any], name: str | None, mount_point: str) -> None:
+def _role_environment(config: InferenceConfig, role: str) -> dict[str, str]:
+    assert config.deployment.type == "disaggregated"
+    role_environment = (
+        config.deployment.prefill_env_vars if role == "prefill" else config.deployment.decode_env_vars
+    )
+    return {**config.env_vars, **role_environment}
+
+
+def _openengine_frontend_arguments(config: InferenceConfig) -> list[str]:
+    arguments: list[str] = []
+    if config.model.max_model_len is not None:
+        arguments.extend(("--max-model-len", str(config.model.max_model_len)))
+    arguments.extend(("--tool-call-parser", config.model.tool_call_parser or "none"))
+    arguments.extend(("--reasoning-parser", config.model.reasoning_parser or "none"))
+    return arguments
+
+
+def _openengine_worker_service(
+    config: InferenceConfig,
+    options: DynamoGraphRenderOptions,
+    *,
+    role: str,
+    replicas: int,
+    config_map_name: str,
+    engine_file: str,
+) -> dict[str, Any]:
+    assert config.deployment.type == "disaggregated"
+    engine_config_path = str(Path(ENGINE_MOUNT_PATH) / engine_file)
+    sidecar_environment = {
+        **_role_environment(config, role),
+        "DYN_ENABLE_RL": "1",
+    }
+    sidecar = {
+        "image": options.image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["dynamo-vllm-sidecar"],
+        "args": [
+            "--openengine-endpoint",
+            f"127.0.0.1:{OPENENGINE_RPC_PORT}",
+            "--openengine-connections",
+            "8",
+            "--connect-timeout-secs",
+            "30",
+            "--health-poll-interval-secs",
+            "2",
+            "--health-deadline-secs",
+            str(OPENENGINE_STARTUP_TIMEOUT_SECONDS),
+        ],
+        "env": [
+            {"name": name, "value": value}
+            for name, value in sorted(sidecar_environment.items())
+        ],
+    }
+    engine_environment = {
+        **_role_environment(config, role),
+        "VLLM_NIXL_SIDE_CHANNEL_PORT": "20100",
+        "VLLM_PLUGINS": "prime_rl",
+    }
+    engine = {
+        "name": "vllm-engine",
+        "image": options.image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["vllm-rs", "serve"],
+        "args": [
+            config.model.name,
+            "--python",
+            "/app/.venv/bin/python",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(OPENENGINE_HTTP_PORT),
+            "--engine-rpc-host",
+            "127.0.0.1",
+            "--engine-rpc-port",
+            str(OPENENGINE_RPC_PORT),
+            "--engine-ready-timeout-secs",
+            str(OPENENGINE_STARTUP_TIMEOUT_SECONDS),
+            "--data-parallel-size",
+            str(config.dynamo_local_dp),
+            "--data-parallel-size-local",
+            str(config.dynamo_local_dp),
+            "--shutdown-timeout",
+            str(OPENENGINE_SHUTDOWN_TIMEOUT_SECONDS),
+            *_openengine_frontend_arguments(config),
+            "--",
+            "--config",
+            engine_config_path,
+        ],
+        "env": [
+            {"name": name, "value": value}
+            for name, value in sorted(engine_environment.items())
+        ]
+        + [
+            {
+                "name": "VLLM_NIXL_SIDE_CHANNEL_HOST",
+                "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}},
+            }
+        ],
+        "resources": {
+            "requests": {"nvidia.com/gpu": str(config.deployment.gpus_per_node)},
+            "limits": {"nvidia.com/gpu": str(config.deployment.gpus_per_node)},
+        },
+        "volumeMounts": [
+            {
+                "name": "dynamo-engine-config",
+                "mountPath": ENGINE_MOUNT_PATH,
+                "readOnly": True,
+            },
+            {"name": "openengine-dshm", "mountPath": "/dev/shm"},
+        ],
+    }
+    pod_spec = {
+        **options.gpu_scheduling.gpu_placement,
+        "terminationGracePeriodSeconds": OPENENGINE_TERMINATION_GRACE_SECONDS,
+        "volumes": [
+            {
+                "name": "dynamo-engine-config",
+                "configMap": {"name": config_map_name},
+            },
+            {
+                "name": "openengine-dshm",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "64Gi"},
+            },
+        ],
+        "containers": [engine],
+        "mainContainer": sidecar,
+    }
+    _apply_pod_credentials(pod_spec, sidecar, options)
+    _apply_pod_credentials(pod_spec, engine, options)
+    return {
+        "componentType": "worker",
+        "subComponentType": role,
+        "replicas": replicas,
+        "extraPodMetadata": {"labels": _release_pod_labels(options)},
+        "extraPodSpec": pod_spec,
+    }
+
+
+def _add_pvc(
+    resource: dict[str, Any],
+    service: dict[str, Any],
+    name: str | None,
+    mount_point: str,
+    *,
+    mount_main_container: bool = True,
+) -> None:
     if not name:
         return
     pvcs = resource["spec"].setdefault("pvcs", [])
@@ -415,11 +617,15 @@ def _add_pvc(resource: dict[str, Any], service: dict[str, Any], name: str | None
     # appends those mounts to extraPodSpec and would otherwise create duplicates.
     pod_spec = service["extraPodSpec"]
     container_mount = {"name": name, "mountPath": mount_point}
-    container_mounts = pod_spec["mainContainer"].setdefault("volumeMounts", [])
-    if container_mount not in container_mounts:
-        if any(mount["mountPath"] == mount_point for mount in container_mounts):
-            raise ValueError(f"PVC {name!r} conflicts with an existing container mount at {mount_point!r}")
-        container_mounts.append(container_mount)
+    containers = [*pod_spec.get("containers", [])]
+    if mount_main_container:
+        containers.insert(0, pod_spec["mainContainer"])
+    for container in containers:
+        container_mounts = container.setdefault("volumeMounts", [])
+        if container_mount not in container_mounts:
+            if any(mount["mountPath"] == mount_point for mount in container_mounts):
+                raise ValueError(f"PVC {name!r} conflicts with an existing container mount at {mount_point!r}")
+            container_mounts.append(container_mount)
 
     pod_volume = {
         "name": name,
@@ -493,12 +699,22 @@ def build_dgd_values(config: InferenceConfig, options: DynamoGraphRenderOptions)
     _validate_dgd_environment(config)
     _validate_typed_credentials(config, options)
 
-    engine_paths = write_role_engine_configs(config, options.output_dir)
+    for artifact_name in _ENGINE_CONFIG_ARTIFACT_NAMES:
+        (options.output_dir / artifact_name).unlink(missing_ok=True)
+
+    openengine = config.backend.engine_transport == "openengine"
+    engine_paths = (
+        write_openengine_role_engine_configs(config, options.output_dir)
+        if openengine
+        else write_role_engine_configs(config, options.output_dir)
+    )
     prefill_text = engine_paths["prefill"].read_text()
     decode_text = engine_paths["decode"].read_text()
+    prefill_engine_file = "prefill-engine.yaml" if openengine else "prefill-engine.json"
+    decode_engine_file = "decode-engine.yaml" if openengine else "decode-engine.json"
     engine_data = {
-        "prefill-engine.json": prefill_text,
-        "decode-engine.json": decode_text,
+        prefill_engine_file: prefill_text,
+        decode_engine_file: decode_text,
     }
     chat_template_content = resolve_chat_template_content(config)
     if chat_template_content is not None:
@@ -560,7 +776,7 @@ def build_dgd_values(config: InferenceConfig, options: DynamoGraphRenderOptions)
         role="prefill",
         replicas=deployment.num_prefill_replicas,
         config_map_name=config_map_name,
-        engine_file="prefill-engine.json",
+        engine_file=prefill_engine_file,
     )
     decode = _worker_service(
         config,
@@ -568,7 +784,7 @@ def build_dgd_values(config: InferenceConfig, options: DynamoGraphRenderOptions)
         role="decode",
         replicas=deployment.num_decode_replicas,
         config_map_name=config_map_name,
-        engine_file="decode-engine.json",
+        engine_file=decode_engine_file,
     )
     client_topology = {
         "schema_version": 1,
@@ -637,7 +853,13 @@ def build_dgd_values(config: InferenceConfig, options: DynamoGraphRenderOptions)
         _add_pvc(resource, service, options.model_cache_pvc, "/model-cache")
     if config.weight_broadcast.type == "filesystem":
         for service in (prefill, decode):
-            _add_pvc(resource, service, options.shared_pvc, "/data")
+            _add_pvc(
+                resource,
+                service,
+                options.shared_pvc,
+                "/data",
+                mount_main_container=not openengine,
+            )
 
     manifest_canonical = _resource_manifest_canonical(resource)
     manifest_hash = _sha256_bytes(manifest_canonical)
@@ -692,7 +914,8 @@ def write_dgd_artifacts(config: InferenceConfig, options: DynamoGraphRenderOptio
     paths["values"].write_bytes(_canonical_json(values))
     paths["resource"].write_bytes(_canonical_json(resource))
     manifest_entries = []
-    for path in sorted(options.output_dir.glob("*.json")):
+    artifact_paths = [*options.output_dir.glob("*.json"), *options.output_dir.glob("*.yaml")]
+    for path in sorted(artifact_paths):
         manifest_entries.append(f"{_sha256_bytes(path.read_bytes())}  {path.name}")
     manifest = options.output_dir / "artifact-manifest.sha256"
     manifest.write_text("\n".join(manifest_entries) + "\n")

@@ -29,11 +29,15 @@ def inference_config(
     weight_broadcast: str = "nccl",
     *,
     chat_template: str | None = None,
+    engine_transport: str = "in_process",
 ) -> InferenceConfig:
     model = {"chat_template": chat_template} if chat_template is not None else {}
     return InferenceConfig.model_validate(
         {
-            "backend": {"type": "dynamo"},
+            "backend": {
+                "type": "dynamo",
+                "engine_transport": engine_transport,
+            },
             "model": model,
             "weight_broadcast": {"type": weight_broadcast},
             "deployment": {

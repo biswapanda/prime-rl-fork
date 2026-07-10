@@ -23,6 +23,8 @@ ENGINE_CONFIG_DIR = "dynamo"
 PREFILL_ENGINE_CONFIG = "prefill-engine.json"
 DECODE_ENGINE_CONFIG = "decode-engine.json"
 AGG_ENGINE_CONFIG = "agg-engine.json"
+PREFILL_OPENENGINE_CONFIG = "prefill-engine.yaml"
+DECODE_OPENENGINE_CONFIG = "decode-engine.yaml"
 CHAT_TEMPLATE_ASSET = "chat-template.jinja"
 
 _ENGINE_CONFIG_EXCLUDED = frozenset(
@@ -340,6 +342,57 @@ def build_engine_config(
     return {key: value for key, value in values.items() if value is not None}
 
 
+def build_openengine_engine_config(
+    config: InferenceConfig,
+    role: Literal["prefill", "decode"],
+    *,
+    kv_events_port: int | None = None,
+) -> dict[str, Any]:
+    """Build a managed-engine config with an unambiguous OpenEngine role."""
+    if config.deployment.type != "disaggregated":
+        raise ValueError("OpenEngine sidecars currently require disaggregated inference")
+    values = build_engine_config(config, role, kv_events_port=kv_events_port)
+    transfer = values.get("kv_transfer_config")
+    if not isinstance(transfer, dict) or not transfer.get("kv_connector"):
+        raise ValueError("OpenEngine disaggregation requires a configured KV transfer connector")
+    resolved_role = "kv_producer" if role == "prefill" else "kv_consumer"
+    resolved_transfer = {
+        **transfer,
+        "kv_role": resolved_role,
+    }
+    if transfer["kv_connector"] == "MultiConnector":
+        extra = transfer.get("kv_connector_extra_config")
+        connectors = extra.get("connectors") if isinstance(extra, dict) else None
+        if not isinstance(connectors, list):
+            raise ValueError("OpenEngine MultiConnector requires a connectors list")
+        if not all(isinstance(connector, dict) for connector in connectors):
+            raise ValueError("OpenEngine MultiConnector entries must be objects")
+        nixl_count = sum(
+            connector.get("kv_connector") == "NixlConnector"
+            for connector in connectors
+        )
+        if nixl_count != 1:
+            raise ValueError("OpenEngine disaggregation requires exactly one nested NixlConnector")
+        resolved_connectors = [
+            {**connector, "kv_role": resolved_role}
+            if connector.get("kv_connector") == "NixlConnector"
+            else {**connector}
+            for connector in connectors
+        ]
+        resolved_transfer = {
+            **resolved_transfer,
+            "kv_connector_extra_config": {
+                **extra,
+                "connectors": resolved_connectors,
+            },
+        }
+    values["kv_transfer_config"] = resolved_transfer
+    # vllm-rs owns model selection positionally; keeping a second model value
+    # in the managed Python config makes precedence needlessly ambiguous.
+    values.pop("model", None)
+    return values
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, default=_json_default, indent=2, sort_keys=True) + "\n")
@@ -365,6 +418,24 @@ def write_role_engine_configs(config: InferenceConfig, output_dir: Path | None =
     }
 
 
+def write_openengine_role_engine_configs(
+    config: InferenceConfig,
+    output_dir: Path | None = None,
+) -> dict[Literal["prefill", "decode"], Path]:
+    """Write role-specific vLLM YAML inputs for the managed Rust frontend."""
+    config_dir = output_dir or (get_config_dir(config.output_dir) / ENGINE_CONFIG_DIR)
+    return {
+        "prefill": _write_json(
+            config_dir / PREFILL_OPENENGINE_CONFIG,
+            build_openengine_engine_config(config, "prefill", kv_events_port=20080),
+        ),
+        "decode": _write_json(
+            config_dir / DECODE_OPENENGINE_CONFIG,
+            build_openengine_engine_config(config, "decode"),
+        ),
+    }
+
+
 def _visible_gpu_ids() -> list[str]:
     configured = os.environ.get("CUDA_VISIBLE_DEVICES")
     if configured:
@@ -386,6 +457,11 @@ def build_local_worker_specs(
     namespace: str | None = None,
 ) -> list[DynamoWorkerSpec]:
     """Allocate local workers and write instance-specific engine configs."""
+    if config.backend.type == "dynamo" and config.backend.engine_transport == "openengine":
+        raise ValueError(
+            "Dynamo OpenEngine transport is rendered as a Kubernetes DynamoGraphDeployment; "
+            "the local inference launcher does not support sidecar pods"
+        )
     config_dir = output_dir or (get_config_dir(config.output_dir) / ENGINE_CONFIG_DIR)
     available = gpu_ids if gpu_ids is not None else _visible_gpu_ids()
     resolved_namespace = namespace or config.env_vars.get("DYN_NAMESPACE") or "dynamo"

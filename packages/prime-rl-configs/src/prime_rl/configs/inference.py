@@ -334,6 +334,13 @@ class VllmInferenceBackendConfig(BaseConfig):
 
 class DynamoInferenceBackendConfig(BaseConfig):
     type: Literal["dynamo"] = "dynamo"
+    engine_transport: Literal["in_process", "openengine"] = "in_process"
+    """Engine boundary used by each Dynamo worker.
+
+    ``in_process`` launches the Python vLLM backend inside the Dynamo worker.
+    ``openengine`` runs a CPU-only Dynamo sidecar beside a GPU-owning
+    ``vllm-rs`` engine and discovers the engine over the OpenEngine protocol.
+    """
 
 
 InferenceBackendConfig: TypeAlias = Annotated[
@@ -507,6 +514,8 @@ class InferenceConfig(BaseConfig):
             )
         if self.deployment.type == "multi_node":
             raise ValueError("Dynamo multi-node inference must use a DynamoGraphDeployment.")
+        if self.backend.engine_transport == "openengine" and self.deployment.type != "disaggregated":
+            raise ValueError("Dynamo OpenEngine transport currently requires a disaggregated DynamoGraphDeployment.")
         if self.enable_lora:
             raise ValueError("The Dynamo backend does not support LoRA weight updates.")
         router = getattr(self.deployment, "router", None)

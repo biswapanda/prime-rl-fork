@@ -1,0 +1,51 @@
+gpu_memory_utilization = 0.90
+enable_prefix_caching = true
+enable_expert_parallel = false
+
+[backend]
+type = "dynamo"
+engine_transport = "openengine"
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+max_model_len = 8192
+enforce_eager = true
+
+[parallel]
+tp = 1
+dp = 1
+
+[weight_broadcast]
+type = "nccl"
+
+[deployment]
+type = "disaggregated"
+gpus_per_node = 1
+prefill_nodes_per_replica = 1
+num_prefill_replicas = 2
+decode_nodes_per_replica = 1
+num_decode_replicas = 2
+
+[deployment.prefill_vllm_overrides]
+max_num_batched_tokens = 8192
+max_num_seqs = 32
+
+[deployment.decode_vllm_overrides]
+max_num_batched_tokens = 8192
+max_num_seqs = 32
+
+[env_vars]
+HF_HOME = "/model-cache"
+HF_HUB_CACHE = "/model-cache/hub"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+NCCL_MNNVL_ENABLE = "0"
+NCCL_NET_PLUGIN = "none"
+NCCL_IB_DISABLE = "1"
+NCCL_SOCKET_IFNAME = "eth0"
+GLOO_SOCKET_IFNAME = "eth0"
+UCX_RCACHE_MAX_UNRELEASED = "1024"

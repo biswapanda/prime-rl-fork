@@ -1,0 +1,157 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS rust-builder-base
+
+USER root
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:${PATH}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates clang cmake curl git libclang-dev \
+      libssl-dev perl pkg-config protobuf-compiler \
+    && apt-get clean autoclean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none
+
+
+FROM rust-builder-base AS dynamo-builder
+
+ARG DYNAMO_COMMIT
+ENV CARGO_TARGET_DIR=/opt/dynamo/target
+COPY dynamo /opt/dynamo
+RUN test "$(git -C /opt/dynamo rev-parse HEAD)" = "$DYNAMO_COMMIT"
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    set -euo pipefail; \
+    mkdir -p /opt/dynamo/dist; \
+    cd /opt/dynamo; \
+    uv build --wheel --out-dir /opt/dynamo/dist; \
+    cd /opt/dynamo/lib/bindings/python; \
+    uvx maturin build --release \
+      --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass" \
+      --out /opt/dynamo/dist; \
+    cd /opt/dynamo; \
+    cargo build --locked --release -p dynamo-vllm-sidecar; \
+    short="${DYNAMO_COMMIT:0:12}"; \
+    for wheel in /opt/dynamo/dist/*.whl; do \
+      base="$(basename "$wheel" .whl)"; \
+      IFS=- read -r -a parts <<< "$base"; \
+      test "${#parts[@]}" -eq 5; \
+      tagged="${parts[0]}-${parts[1]}-1dynamo${short}-${parts[2]}-${parts[3]}-${parts[4]}.whl"; \
+      mv "$wheel" "/opt/dynamo/dist/$tagged"; \
+    done; \
+    printf '%s\n' "$DYNAMO_COMMIT" > "/opt/dynamo/dist/DYNAMO_COMMIT-${short}.txt"; \
+    cd /opt/dynamo/dist; \
+    sha256sum ./*.whl > "SHA256SUMS-${short}.txt"; \
+    sha256sum /opt/dynamo/target/release/dynamo-vllm-sidecar \
+      > "DYNAMO_VLLM_SIDECAR_SHA256-${short}.txt"
+
+
+FROM rust-builder-base AS vllm-builder
+
+ARG VLLM_COMMIT
+ARG VLLM_BASE_COMMIT
+ARG VLLM_OPENENGINE_SERVICE_COMMIT
+ENV CARGO_TARGET_DIR=/opt/vllm/rust/target
+COPY vllm /opt/vllm
+RUN test "$(git -C /opt/vllm rev-parse HEAD)" = "$VLLM_COMMIT" \
+    && test "$(git -C /opt/vllm merge-base "$VLLM_COMMIT" "$VLLM_BASE_COMMIT")" = "$VLLM_BASE_COMMIT" \
+    && test "$(git -C /opt/vllm merge-base "$VLLM_COMMIT" "$VLLM_OPENENGINE_SERVICE_COMMIT")" = \
+      "$VLLM_OPENENGINE_SERVICE_COMMIT" \
+    && test "$(git -C /opt/vllm diff --name-only "$VLLM_BASE_COMMIT".."$VLLM_COMMIT" -- vllm \
+      | sort | tr '\n' ' ')" = "vllm/v1/engine/__init__.py vllm/v1/engine/core.py "
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    set -euo pipefail; \
+    cd /opt/vllm/rust; \
+    cargo build --locked --release -p vllm-cmd; \
+    sha256sum /opt/vllm/rust/target/release/vllm-rs \
+      > /opt/vllm/VLLM_RS_SHA256.txt
+
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+ARG PRIME_COMMIT
+ARG DYNAMO_COMMIT
+ARG VLLM_COMMIT
+ARG VLLM_BASE_COMMIT
+ARG VLLM_OPENENGINE_SERVICE_COMMIT
+ARG OPENENGINE_PROTO_SHA256
+ARG PRIME_RL_PROTO_SHA256
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN printf '%s  %s\n' \
+      27b23827a86fd488f1f7cc9a2722fe76d284087ca7cfefef5a30c5e74f21bc71 \
+      /app/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py \
+    | sha256sum --check --strict
+
+COPY --chown=appuser:appuser prime-rl/src/prime_rl /app/src/prime_rl
+COPY --chown=appuser:appuser prime-rl/packages/prime-rl-configs/src/prime_rl \
+    /app/packages/prime-rl-configs/src/prime_rl
+COPY --chown=appuser:appuser vllm/vllm/v1/engine/core.py \
+    /app/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py
+COPY --chown=appuser:appuser vllm/vllm/v1/engine/__init__.py \
+    /app/.venv/lib/python3.12/site-packages/vllm/v1/engine/__init__.py
+COPY --from=dynamo-builder /opt/dynamo/dist /opt/dynamo/wheels
+COPY --from=dynamo-builder /opt/dynamo/target/release/dynamo-vllm-sidecar \
+    /usr/local/bin/dynamo-vllm-sidecar
+COPY --from=vllm-builder /opt/vllm/rust/target/release/vllm-rs \
+    /usr/local/bin/vllm-rs
+COPY --from=vllm-builder /opt/vllm/VLLM_RS_SHA256.txt /opt/openengine/VLLM_RS_SHA256.txt
+COPY dynamo/lib/vllm-sidecar/proto/openengine.proto /opt/openengine/dynamo-openengine.proto
+COPY vllm/rust/proto/openengine.proto /opt/openengine/vllm-openengine.proto
+COPY dynamo/lib/vllm-sidecar/proto/prime_rl.proto /opt/openengine/dynamo-prime-rl.proto
+COPY vllm/rust/proto/prime_rl.proto /opt/openengine/vllm-prime-rl.proto
+
+RUN set -euo pipefail; \
+    uv pip install --python /app/.venv/bin/python --reinstall --no-deps \
+      /opt/dynamo/wheels/ai_dynamo-*.whl \
+      /opt/dynamo/wheels/ai_dynamo_runtime-*.whl; \
+    chmod 755 /usr/local/bin/dynamo-vllm-sidecar /usr/local/bin/vllm-rs; \
+    cmp /opt/openengine/dynamo-openengine.proto /opt/openengine/vllm-openengine.proto; \
+    cmp /opt/openengine/dynamo-prime-rl.proto /opt/openengine/vllm-prime-rl.proto; \
+    test "$(sha256sum /opt/openengine/vllm-openengine.proto | awk '{print $1}')" = \
+      "$OPENENGINE_PROTO_SHA256"; \
+    test "$(sha256sum /opt/openengine/vllm-prime-rl.proto | awk '{print $1}')" = \
+      "$PRIME_RL_PROTO_SHA256"; \
+    /app/.venv/bin/python -c \
+      "from vllm.v1.engine import EngineCoreReadyResponse; import dynamo._core, dynamo.frontend, prime_rl"; \
+    vllm_help="$(vllm-rs serve --help)"; \
+    grep -q -- '--engine-rpc-port' <<< "$vllm_help"; \
+    grep -q -- '--engine-rpc-host' <<< "$vllm_help"; \
+    sidecar_help="$(dynamo-vllm-sidecar --help 2>&1 || true)"; \
+    grep -q -- '--openengine-endpoint' <<< "$sidecar_help"; \
+    test -z "$(ldd /usr/local/bin/vllm-rs | grep 'not found' || true)"; \
+    test -z "$(ldd /usr/local/bin/dynamo-vllm-sidecar | grep 'not found' || true)"; \
+    mkdir -p /opt/openengine; \
+    printf '%s\n' "$PRIME_COMMIT" > /opt/openengine/PRIME_COMMIT; \
+    printf '%s\n' "$DYNAMO_COMMIT" > /opt/openengine/DYNAMO_COMMIT; \
+    printf '%s\n' "$VLLM_COMMIT" > /opt/openengine/VLLM_COMMIT; \
+    printf '%s\n' "$VLLM_BASE_COMMIT" > /opt/openengine/VLLM_BASE_COMMIT; \
+    printf '%s\n' "$VLLM_OPENENGINE_SERVICE_COMMIT" \
+      > /opt/openengine/VLLM_OPENENGINE_SERVICE_COMMIT; \
+    printf '%s\n' "$OPENENGINE_PROTO_SHA256" > /opt/openengine/OPENENGINE_PROTO_SHA256; \
+    printf '%s\n' "$PRIME_RL_PROTO_SHA256" > /opt/openengine/PRIME_RL_PROTO_SHA256; \
+    sha256sum /usr/local/bin/dynamo-vllm-sidecar \
+      > /opt/openengine/DYNAMO_VLLM_SIDECAR_SHA256.txt; \
+    sha256sum /usr/local/bin/vllm-rs > /opt/openengine/VLLM_RS_INSTALLED_SHA256.txt; \
+    chown -R appuser:appuser /opt/dynamo /opt/openengine /app/src /app/packages
+
+ENV DYNAMO_BUILD_COMMIT=${DYNAMO_COMMIT} \
+    OPENENGINE_VLLM_COMMIT=${VLLM_COMMIT}
+LABEL org.opencontainers.image.prime.commit=${PRIME_COMMIT} \
+      org.opencontainers.image.dynamo.commit=${DYNAMO_COMMIT} \
+      org.opencontainers.image.vllm.commit=${VLLM_COMMIT} \
+      org.opencontainers.image.vllm.base-commit=${VLLM_BASE_COMMIT} \
+      org.opencontainers.image.vllm.openengine-service-commit=${VLLM_OPENENGINE_SERVICE_COMMIT} \
+      org.opencontainers.image.openengine.proto-sha256=${OPENENGINE_PROTO_SHA256} \
+      org.opencontainers.image.prime-rl.proto-sha256=${PRIME_RL_PROTO_SHA256}
+USER appuser

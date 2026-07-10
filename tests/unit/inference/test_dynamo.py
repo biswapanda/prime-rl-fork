@@ -10,6 +10,7 @@ from prime_rl.inference.dynamo import (
     build_engine_config,
     build_frontend_process,
     build_local_worker_specs,
+    build_openengine_engine_config,
     build_worker_environment,
     build_worker_process,
     write_role_engine_configs,
@@ -44,6 +45,29 @@ def test_role_engine_configs_share_nixl_and_only_prefill_publishes_events(tmp_pa
     assert "kv_events_config" not in decode
     assert prefill["worker_extension_cls"].endswith("NCCLWeightUpdateWorker")
     assert decode["worker_extension_cls"] == prefill["worker_extension_cls"]
+
+
+@pytest.mark.parametrize(
+    ("role", "expected_role"),
+    [("prefill", "kv_producer"), ("decode", "kv_consumer")],
+)
+def test_openengine_multiconnector_sets_role_on_nested_nixl_only(role: str, expected_role: str):
+    config = disaggregated_config(
+        kv_cache_offload={"type": "native", "cpu": {"num_bytes": 1 << 30}},
+    )
+
+    engine_config = build_openengine_engine_config(config, role)
+    transfer = engine_config["kv_transfer_config"]
+    connectors = transfer["kv_connector_extra_config"]["connectors"]
+    nixl = next(connector for connector in connectors if connector["kv_connector"] == "NixlConnector")
+    offload = next(
+        connector for connector in connectors if connector["kv_connector"] == "OffloadingConnector"
+    )
+
+    assert transfer["kv_connector"] == "MultiConnector"
+    assert transfer["kv_role"] == expected_role
+    assert nixl["kv_role"] == expected_role
+    assert offload["kv_role"] == "kv_both"
 
 
 def test_role_overrides_are_isolated():
@@ -383,3 +407,25 @@ def test_child_exit_tears_down_complete_process_group(
     assert exc.value.code == supervisor_code
     assert len(processes) == 5
     assert terminated == list(reversed(processes))
+
+
+def test_local_launcher_rejects_openengine_transport():
+    config = disaggregated_config(
+        backend={"type": "dynamo", "engine_transport": "openengine"},
+    )
+
+    with pytest.raises(ValueError, match="local inference launcher does not support sidecar pods"):
+        dynamo.run_dynamo_local(config)
+
+
+def test_local_worker_specs_reject_openengine_dry_run_path():
+    config = disaggregated_config(
+        backend={"type": "dynamo", "engine_transport": "openengine"},
+    )
+
+    with pytest.raises(ValueError, match="local inference launcher does not support sidecar pods"):
+        build_local_worker_specs(
+            config,
+            output_dir=config.output_dir,
+            gpu_ids=["<gpu:0>", "<gpu:1>", "<gpu:2>", "<gpu:3>"],
+        )

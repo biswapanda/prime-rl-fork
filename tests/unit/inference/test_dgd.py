@@ -15,6 +15,7 @@ from prime_rl.inference.dgd import (
     _add_pvc,
     _parse_args,
     _parse_kubernetes_toleration,
+    _worker_topology_binding,
     build_dgd_values,
     write_dgd_artifacts,
 )
@@ -37,20 +38,32 @@ def inference_config(
     weight_broadcast: str = "nccl",
     *,
     chat_template: str | None = None,
+    engine_transport: str = "in_process",
+    gpus_per_node: int = 1,
+    tp: int = 1,
+    tool_call_parser: str | None = "auto",
+    reasoning_parser: str | None = "auto",
 ) -> InferenceConfig:
-    model = {"name": "Qwen/Qwen3-30B-A3B-Thinking-2507"}
+    model = {
+        "name": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+        "tool_call_parser": tool_call_parser,
+        "reasoning_parser": reasoning_parser,
+    }
     if chat_template is not None:
         model["chat_template"] = chat_template
     return InferenceConfig.model_validate(
         {
-            "backend": {"type": "dynamo"},
+            "backend": {
+                "type": "dynamo",
+                "engine_transport": engine_transport,
+            },
             "model": model,
-            "parallel": {"tp": 1},
+            "parallel": {"tp": tp},
             "weight_broadcast": {"type": weight_broadcast},
             "env_vars": {"HF_HOME": "/model-cache", "HF_HUB_OFFLINE": "1"},
             "deployment": {
                 "type": "disaggregated",
-                "gpus_per_node": 1,
+                "gpus_per_node": gpus_per_node,
                 "prefill_nodes_per_replica": 1,
                 "decode_nodes_per_replica": 1,
                 "num_prefill_replicas": 2,
@@ -284,6 +297,141 @@ def test_dgd_values_derive_topology_and_role_configs(tmp_path: Path):
     assert "enable_rl" not in decode
 
 
+def test_dgd_openengine_transport_splits_engine_and_sidecar(tmp_path: Path):
+    config = inference_config(engine_transport="openengine")
+    paths = write_dgd_artifacts(config, render_options(tmp_path))
+    values = json.loads(paths["values"].read_text())
+    assert "prefill-engine.yaml" in paths["manifest"].read_text()
+    assert "decode-engine.yaml" in paths["manifest"].read_text()
+    graph = values["inference"]["dynamoGraph"]
+    services = graph["resource"]["spec"]["services"]
+
+    for service_name, role in (
+        ("VllmPrefillWorker", "prefill"),
+        ("VllmDecodeWorker", "decode"),
+    ):
+        service = services[service_name]
+        pod_spec = service["extraPodSpec"]
+        sidecar = pod_spec["mainContainer"]
+        engine = pod_spec["containers"][0]
+
+        assert sidecar["command"] == ["dynamo-vllm-sidecar"]
+        assert sidecar["args"] == [
+            "--openengine-endpoint",
+            "127.0.0.1:50051",
+            "--openengine-connections",
+            "8",
+            "--connect-timeout-secs",
+            "30",
+            "--health-poll-interval-secs",
+            "2",
+            "--health-deadline-secs",
+            "1800",
+        ]
+        assert "resources" not in sidecar
+        assert engine["name"] == "vllm-engine"
+        assert engine["command"] == ["vllm-rs", "serve"]
+        assert engine["args"][0] == config.model.name
+        assert engine["args"][-3:] == [
+            "--",
+            "--config",
+            f"/etc/prime-rl/dynamo/{role}-engine.yaml",
+        ]
+        assert engine["resources"] == {
+            "requests": {"nvidia.com/gpu": "1"},
+            "limits": {"nvidia.com/gpu": "1"},
+        }
+        assert "--data-parallel-size" in engine["args"]
+        assert engine["args"][engine["args"].index("--data-parallel-size") + 1] == "1"
+        assert pod_spec["terminationGracePeriodSeconds"] == 180
+        assert "resources" not in service
+        assert pod_spec["mainContainer"]["volumeMounts"].count(
+            {"name": "model-cache", "mountPath": "/model-cache"}
+        ) == 1
+        assert engine["volumeMounts"].count(
+            {"name": "model-cache", "mountPath": "/model-cache"}
+        ) == 1
+
+    engine_data = graph["engineConfig"]["data"]
+    prefill = json.loads(engine_data["prefill-engine.yaml"])
+    decode = json.loads(engine_data["decode-engine.yaml"])
+    assert prefill["kv_transfer_config"]["kv_role"] == "kv_producer"
+    assert decode["kv_transfer_config"]["kv_role"] == "kv_consumer"
+    assert "kv_events_config" in prefill
+    assert "kv_events_config" not in decode
+    assert "model" not in prefill
+    assert "model" not in decode
+
+    assert json.loads(graph["topologyBinding"]["canonical"])["workerServices"] == {
+        "VllmDecodeWorker": {
+            "limitsGpu": "1",
+            "replicas": 2,
+            "requestsGpu": "1",
+            "role": "decode",
+        },
+        "VllmPrefillWorker": {
+            "limitsGpu": "1",
+            "replicas": 2,
+            "requestsGpu": "1",
+            "role": "prefill",
+        },
+    }
+
+
+def test_worker_topology_binding_reads_openengine_engine_resources(tmp_path: Path):
+    values = build_dgd_values(
+        inference_config(engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    services = values["inference"]["dynamoGraph"]["resource"]["spec"]["services"]
+    worker = deepcopy(services["VllmDecodeWorker"])
+    worker["extraPodSpec"]["containers"][0]["resources"] = {
+        "requests": {"nvidia.com/gpu": "3"},
+        "limits": {"nvidia.com/gpu": "4"},
+    }
+
+    binding = _worker_topology_binding({"VllmDecodeWorker": worker})
+
+    assert binding["VllmDecodeWorker"]["requestsGpu"] == "3"
+    assert binding["VllmDecodeWorker"]["limitsGpu"] == "4"
+
+
+def test_worker_topology_binding_rejects_service_and_engine_gpu_shadowing(tmp_path: Path):
+    values = build_dgd_values(
+        inference_config(engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    worker = deepcopy(
+        values["inference"]["dynamoGraph"]["resource"]["spec"]["services"]["VllmDecodeWorker"]
+    )
+    worker["resources"] = {
+        "requests": {"gpu": "1"},
+        "limits": {"gpu": "1"},
+    }
+
+    with pytest.raises(ValueError, match="cannot declare both service and vllm-engine GPU resources"):
+        _worker_topology_binding({"VllmDecodeWorker": worker})
+
+
+def test_dgd_openengine_transport_propagates_local_dp_and_parser_disable(tmp_path: Path):
+    config = inference_config(
+        engine_transport="openengine",
+        gpus_per_node=4,
+        tp=2,
+        tool_call_parser=None,
+        reasoning_parser=None,
+    )
+
+    values = build_dgd_values(config, render_options(tmp_path))
+    services = values["inference"]["dynamoGraph"]["resource"]["spec"]["services"]
+    args = services["VllmDecodeWorker"]["extraPodSpec"]["containers"][0]["args"]
+
+    assert args[args.index("--data-parallel-size") + 1] == "2"
+    assert args[args.index("--data-parallel-size-local") + 1] == "2"
+    assert args[args.index("--tool-call-parser") + 1] == "none"
+    assert args[args.index("--reasoning-parser") + 1] == "none"
+
+
 def test_dgd_artifacts_are_deterministic_and_manifest_verifies(tmp_path: Path):
     paths = write_dgd_artifacts(inference_config(), render_options(tmp_path))
     first_values = paths["values"].read_bytes()
@@ -307,6 +455,39 @@ def test_dgd_artifacts_are_deterministic_and_manifest_verifies(tmp_path: Path):
     values = json.loads(paths["values"].read_text())
     assert values["inference"]["dynamoGraph"]["manifestCanonical"].encode() == canonical_resource
     assert hashlib.sha256(canonical_resource).hexdigest() == expected_manifest_hash
+
+
+def test_dgd_artifacts_remove_stale_engine_transport_configs(tmp_path: Path):
+    write_dgd_artifacts(inference_config(), render_options(tmp_path))
+    assert (tmp_path / "prefill-engine.json").exists()
+    assert (tmp_path / "decode-engine.json").exists()
+
+    paths = write_dgd_artifacts(
+        inference_config(engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    manifest = paths["manifest"].read_text()
+
+    assert not (tmp_path / "prefill-engine.json").exists()
+    assert not (tmp_path / "decode-engine.json").exists()
+    assert "prefill-engine.json" not in manifest
+    assert "decode-engine.json" not in manifest
+    assert "prefill-engine.yaml" in manifest
+    assert "decode-engine.yaml" in manifest
+
+
+def test_openengine_filesystem_weights_mount_only_on_gpu_engine(tmp_path: Path):
+    values = build_dgd_values(
+        inference_config("filesystem", engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    services = values["inference"]["dynamoGraph"]["resource"]["spec"]["services"]
+    data_mount = {"name": "p4-shared-data", "mountPath": "/data"}
+
+    for service_name in ("VllmPrefillWorker", "VllmDecodeWorker"):
+        pod_spec = services[service_name]["extraPodSpec"]
+        assert data_mount not in pod_spec["mainContainer"].get("volumeMounts", [])
+        assert data_mount in pod_spec["containers"][0]["volumeMounts"]
 
 
 def test_dgd_embeds_and_mounts_content_addressed_chat_template(tmp_path: Path):

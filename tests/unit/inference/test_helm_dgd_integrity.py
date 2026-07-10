@@ -196,6 +196,76 @@ def test_dgd_chart_rejects_consistently_rehashed_image_digest_drift(tmp_path: Pa
     assert "image-digest annotation" in error.value.stderr
 
 
+def test_dgd_chart_rejects_rehashed_openengine_engine_image_drift(tmp_path: Path):
+    paths = write_dgd_artifacts(
+        inference_config(engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    values = json.loads(paths["values"].read_text())
+    graph = values["inference"]["dynamoGraph"]
+    workload = json.loads(graph["workloadBinding"]["canonical"])
+    engine = graph["resource"]["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]["containers"][0]
+    engine["image"] = engine["image"].rsplit("@", 1)[0] + f"@sha256:{'4' * 64}"
+    rewrite_valid_integrity(values, workload)
+    mutation = tmp_path / "rehashed-openengine-image-drift.json"
+    mutation.write_text(json.dumps(values))
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        helm_template("-f", str(mutation))
+
+    assert "container vllm-engine must use the same image.reference" in error.value.stderr
+
+
+def test_dgd_chart_rejects_rehashed_openengine_engine_gpu_drift(tmp_path: Path):
+    paths = write_dgd_artifacts(
+        inference_config(engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    values = json.loads(paths["values"].read_text())
+    graph = values["inference"]["dynamoGraph"]
+    workload = json.loads(graph["workloadBinding"]["canonical"])
+    engine = graph["resource"]["spec"]["services"]["VllmDecodeWorker"]["extraPodSpec"]["containers"][0]
+    engine["resources"] = {
+        "requests": {"nvidia.com/gpu": "2"},
+        "limits": {"nvidia.com/gpu": "2"},
+    }
+    rewrite_valid_integrity(values, workload)
+    mutation = tmp_path / "rehashed-openengine-gpu-drift.json"
+    mutation.write_text(json.dumps(values))
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        helm_template("-f", str(mutation))
+
+    assert "must match the renderer topology binding" in error.value.stderr
+
+
+def test_dgd_chart_rejects_rehashed_openengine_gpu_resource_shadowing(tmp_path: Path):
+    paths = write_dgd_artifacts(
+        inference_config(engine_transport="openengine"),
+        render_options(tmp_path),
+    )
+    values = json.loads(paths["values"].read_text())
+    graph = values["inference"]["dynamoGraph"]
+    workload = json.loads(graph["workloadBinding"]["canonical"])
+    worker = graph["resource"]["spec"]["services"]["VllmDecodeWorker"]
+    worker["resources"] = {
+        "requests": {"gpu": "1"},
+        "limits": {"gpu": "1"},
+    }
+    worker["extraPodSpec"]["containers"][0]["resources"] = {
+        "requests": {"nvidia.com/gpu": "2"},
+        "limits": {"nvidia.com/gpu": "2"},
+    }
+    rewrite_valid_integrity(values, workload)
+    mutation = tmp_path / "rehashed-openengine-gpu-shadow.json"
+    mutation.write_text(json.dumps(values))
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        helm_template("-f", str(mutation))
+
+    assert "cannot declare both service and vllm-engine GPU resources" in error.value.stderr
+
+
 @pytest.mark.parametrize(
     ("annotation", "label"),
     [

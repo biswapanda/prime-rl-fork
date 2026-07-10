@@ -25,6 +25,10 @@ class FileSystemWeightUpdateWorker(Worker):
         """No-op RPC used by the API server liveness endpoint."""
         return None
 
+    def destroy_broadcaster(self) -> None:
+        """Complete the no-op filesystem broadcaster lifecycle."""
+        return None
+
     def update_weights_from_path(self, weight_path: str) -> None:
         """Update weights from a specified path in shared filesystem containing a HF-compatible checkpoint."""
         # Get vLLM model runner and model

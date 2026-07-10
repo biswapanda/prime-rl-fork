@@ -77,11 +77,12 @@
 {{- if ne (required (printf "%s componentType is required" $serviceName) $service.componentType) "worker" }}
 {{- fail (printf "DynamoGraphDeployment service %s must be a worker in the renderer topology binding" $serviceName) }}
 {{- end }}
+{{- $gpuResources := include "prime-rl.dynamoWorkerGPUResources" (list $serviceName $service) | mustFromJson }}
 {{- $actualWorker := dict
       "role" (required (printf "%s subComponentType is required" $serviceName) $service.subComponentType)
       "replicas" (required (printf "%s replicas is required" $serviceName) $service.replicas)
-      "requestsGpu" (required (printf "%s GPU request is required" $serviceName) $service.resources.requests.gpu)
-      "limitsGpu" (required (printf "%s GPU limit is required" $serviceName) $service.resources.limits.gpu) }}
+      "requestsGpu" (index $gpuResources "requestsGpu")
+      "limitsGpu" (index $gpuResources "limitsGpu") }}
 {{- if ne (toJson $expectedWorker) (toJson $actualWorker) }}
 {{- fail (printf "DynamoGraphDeployment service %s must match the renderer topology binding" $serviceName) }}
 {{- end }}
@@ -100,7 +101,8 @@
 {{- end }}
 {{- $gpusPerWorker := printf "%v" (required "clientTopology.dynamo_gpus_per_worker is required" $topology.dynamo_gpus_per_worker) }}
 {{- range $serviceName, $service := dict "VllmDecodeWorker" $decode "VllmPrefillWorker" $prefill }}
-{{- if or (ne (printf "%v" $service.resources.requests.gpu) $gpusPerWorker) (ne (printf "%v" $service.resources.limits.gpu) $gpusPerWorker) }}
+{{- $gpuResources := include "prime-rl.dynamoWorkerGPUResources" (list $serviceName $service) | mustFromJson }}
+{{- if or (ne (printf "%v" (index $gpuResources "requestsGpu")) $gpusPerWorker) (ne (printf "%v" (index $gpuResources "limitsGpu")) $gpusPerWorker) }}
 {{- fail (printf "DynamoGraphDeployment service %s GPU resources must match the client topology binding" $serviceName) }}
 {{- end }}
 {{- end }}
@@ -321,9 +323,18 @@
 {{- end }}
 {{- end }}
 {{- range $serviceName, $service := $resource.spec.services }}
-{{- $serviceImage := required (printf "DynamoGraphDeployment service %s image is required" $serviceName) $service.extraPodSpec.mainContainer.image }}
+{{- $pod := required (printf "DynamoGraphDeployment service %s extraPodSpec is required" $serviceName) $service.extraPodSpec }}
+{{- $mainContainer := required (printf "DynamoGraphDeployment service %s mainContainer is required" $serviceName) $pod.mainContainer }}
+{{- $serviceImage := required (printf "DynamoGraphDeployment service %s image is required" $serviceName) $mainContainer.image }}
 {{- if ne $image $serviceImage }}
 {{- fail (printf "DynamoGraphDeployment service %s must use the same image.reference as orchestrator and trainer" $serviceName) }}
+{{- end }}
+{{- range $container := default (list) (index $pod "containers") }}
+{{- $containerName := required (printf "DynamoGraphDeployment service %s extra container name is required" $serviceName) $container.name }}
+{{- $containerImage := required (printf "DynamoGraphDeployment service %s container %s image is required" $serviceName $containerName) $container.image }}
+{{- if ne $image $containerImage }}
+{{- fail (printf "DynamoGraphDeployment service %s container %s must use the same image.reference as orchestrator and trainer" $serviceName $containerName) }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- toYaml $resource }}
