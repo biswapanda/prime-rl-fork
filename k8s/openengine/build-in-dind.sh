@@ -19,6 +19,10 @@ VLLM_OPENENGINE_SERVICE_COMMIT=${VLLM_OPENENGINE_SERVICE_COMMIT:-fe9847d70309064
 OPENENGINE_PROTO_SHA256=${OPENENGINE_PROTO_SHA256:-1add17e5f3dbb595f8b4aed5697daa212828d7e31d50769dcf51b83a37b4cfb8}
 PRIME_RL_PROTO_SHA256=${PRIME_RL_PROTO_SHA256:-c56d5e41e9bf599cca64af2f70b8fc782580f218dffe39ee81bef5ab23737f99}
 VLLM_BUNDLE=${VLLM_BUNDLE:-/build/incoming/vllm-openengine.bundle}
+PRIME_BUNDLE=${PRIME_BUNDLE:-}
+PRIME_BUNDLE_SHA256=${PRIME_BUNDLE_SHA256:-}
+DYNAMO_BUNDLE=${DYNAMO_BUNDLE:-}
+DYNAMO_BUNDLE_SHA256=${DYNAMO_BUNDLE_SHA256:-}
 GITEA_URL=${GITEA_URL:-http://biswa-gitea:3000}
 IMAGE_REPOSITORY=${IMAGE_REPOSITORY:-nvcr.io/nvidian/dynamo-dev/biswa}
 BASE_IMAGE=${BASE_IMAGE:-nvcr.io/nvidian/dynamo-dev/biswa:prime-p4-39bc54c8096c-dynamo-f4ac89d6eac0-arm64@sha256:07bb41622c701743e9497246ebc97e2374b1f5265bf1897bcba0d96201a2d355}
@@ -43,15 +47,24 @@ export GIT_ASKPASS=/tmp/gitea-askpass
 export GIT_TERMINAL_PROMPT=0
 
 clone_exact() {
-  local repository=$1 branch=$2 commit=$3 destination=$4
-  GIT_LFS_SKIP_SMUDGE=1 git clone --branch "$branch" --single-branch \
-    "$GITEA_URL/biswa/$repository.git" "$destination"
+  local repository=$1 branch=$2 commit=$3 destination=$4 bundle=$5 bundle_sha256=$6
+  if [ -n "$bundle" ]; then
+    test -n "$bundle_sha256"
+    test "$(sha256sum "$bundle" | awk '{print $1}')" = "$bundle_sha256"
+    GIT_LFS_SKIP_SMUDGE=1 git clone "$bundle" "$destination"
+    git -C "$destination" checkout --detach "$commit"
+  else
+    GIT_LFS_SKIP_SMUDGE=1 git clone --branch "$branch" --single-branch \
+      "$GITEA_URL/biswa/$repository.git" "$destination"
+  fi
   test "$(git -C "$destination" rev-parse HEAD)" = "$commit"
   test -z "$(git -C "$destination" status --porcelain)"
 }
 
-clone_exact prime-rl-2 "$PRIME_BRANCH" "$PRIME_COMMIT" "$WORK_ROOT/prime-rl"
-clone_exact dynamo2 "$DYNAMO_BRANCH" "$DYNAMO_COMMIT" "$WORK_ROOT/dynamo"
+clone_exact prime-rl-2 "$PRIME_BRANCH" "$PRIME_COMMIT" "$WORK_ROOT/prime-rl" \
+  "$PRIME_BUNDLE" "$PRIME_BUNDLE_SHA256"
+clone_exact dynamo2 "$DYNAMO_BRANCH" "$DYNAMO_COMMIT" "$WORK_ROOT/dynamo" \
+  "$DYNAMO_BUNDLE" "$DYNAMO_BUNDLE_SHA256"
 test "$(sha256sum "$VLLM_BUNDLE" | awk '{print $1}')" = "$VLLM_BUNDLE_SHA256"
 GIT_LFS_SKIP_SMUDGE=1 git clone "$VLLM_BUNDLE" "$WORK_ROOT/vllm"
 git -C "$WORK_ROOT/vllm" checkout --detach "$VLLM_COMMIT"
@@ -80,8 +93,12 @@ RUN_TS=$RUN_TS
 BASE_IMAGE=$BASE_IMAGE
 PRIME_BRANCH=$PRIME_BRANCH
 PRIME_COMMIT=$PRIME_COMMIT
+PRIME_BUNDLE=$PRIME_BUNDLE
+PRIME_BUNDLE_SHA256=$PRIME_BUNDLE_SHA256
 DYNAMO_BRANCH=$DYNAMO_BRANCH
 DYNAMO_COMMIT=$DYNAMO_COMMIT
+DYNAMO_BUNDLE=$DYNAMO_BUNDLE
+DYNAMO_BUNDLE_SHA256=$DYNAMO_BUNDLE_SHA256
 VLLM_COMMIT=$VLLM_COMMIT
 VLLM_BASE_COMMIT=$VLLM_BASE_COMMIT
 VLLM_OPENENGINE_SERVICE_COMMIT=$VLLM_OPENENGINE_SERVICE_COMMIT
