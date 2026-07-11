@@ -101,7 +101,7 @@ COPY --chown=appuser:appuser vllm/vllm/v1/engine/core.py \
     /app/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py
 COPY --chown=appuser:appuser vllm/vllm/v1/engine/__init__.py \
     /app/.venv/lib/python3.12/site-packages/vllm/v1/engine/__init__.py
-COPY --from=dynamo-builder /opt/dynamo/dist /opt/dynamo/wheels
+COPY --from=dynamo-builder /opt/dynamo/dist /opt/openengine-dynamo-wheels
 COPY --from=dynamo-builder /opt/dynamo/target/release/dynamo-vllm-sidecar \
     /usr/local/bin/dynamo-vllm-sidecar
 COPY --from=vllm-builder /opt/vllm/rust/target/release/vllm-rs \
@@ -113,6 +113,8 @@ COPY dynamo/lib/vllm-sidecar/proto/prime_rl.proto /opt/openengine/dynamo-prime-r
 COPY vllm/rust/proto/prime_rl.proto /opt/openengine/vllm-prime-rl.proto
 
 RUN set -euo pipefail; \
+    rm -rf /opt/dynamo/wheels; \
+    mv /opt/openengine-dynamo-wheels /opt/dynamo/wheels; \
     uv pip install --python /app/.venv/bin/python --reinstall --no-deps \
       /opt/dynamo/wheels/ai_dynamo-*.whl \
       /opt/dynamo/wheels/ai_dynamo_runtime-*.whl; \
