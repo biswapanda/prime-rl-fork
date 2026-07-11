@@ -28,6 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     set -euo pipefail; \
+    rm -rf /opt/dynamo/dist; \
     mkdir -p /opt/dynamo/dist; \
     cd /opt/dynamo; \
     uv build --wheel --out-dir /opt/dynamo/dist; \
