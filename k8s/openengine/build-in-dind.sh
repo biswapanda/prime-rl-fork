@@ -29,9 +29,20 @@ BASE_IMAGE=${BASE_IMAGE:-nvcr.io/nvidian/dynamo-dev/biswa:prime-p4-39bc54c8096c-
 RUN_TS=${RUN_TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 WORK_ROOT=/build/openengine-$RUN_TS
 ARTIFACT_ROOT=/models/bis-rl-3/biswa-p4/builds/openengine-$RUN_TS
+DOCKER_CONFIG=$WORK_ROOT/docker-config
+export DOCKER_CONFIG
 
-mkdir -p /root/.docker "$WORK_ROOT" "$ARTIFACT_ROOT"
-cp /run/secrets/nvcr/config.json /root/.docker/config.json
+cleanup() {
+  rm -f /tmp/gitea-askpass
+  rm -rf "$DOCKER_CONFIG"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "$DOCKER_CONFIG" "$WORK_ROOT" "$ARTIFACT_ROOT"
+cp /run/secrets/nvcr/config.json "$DOCKER_CONFIG/config.json"
 apk add --no-cache bash coreutils git jq >/dev/null
 
 cat > /tmp/gitea-askpass <<'EOF'
