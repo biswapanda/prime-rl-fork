@@ -5,7 +5,7 @@ import os
 from collections.abc import Mapping
 from itertools import cycle
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 import httpx
 import verifiers.v1 as vf
@@ -123,6 +123,8 @@ class StaticInferencePool:
         eval_client_type: str = "openai_chat_completions",
         renderer_config: RendererConfig | None = None,
         pool_size: int | None = None,
+        *,
+        admin_clients: list[AsyncClient] | None = None,
     ):
         renderer_model_name = model_name if train_client_type == "renderer" else None
         self._train_clients = setup_clients(
@@ -133,7 +135,7 @@ class StaticInferencePool:
             pool_size=pool_size,
         )
         self._eval_clients = setup_clients(client_config, client_type=eval_client_type)
-        self._admin_clients = setup_admin_clients(client_config)
+        self._admin_clients = setup_admin_clients(client_config) if admin_clients is None else admin_clients
         # When admin URLs bypass a router, also health-check the client-facing
         # (router) endpoint - it only starts serving once its workers are healthy.
         self._router_clients = (
@@ -196,6 +198,7 @@ async def setup_inference_pool(
     eval_client_type: str = "openai_chat_completions",
     renderer_config: RendererConfig | None = None,
     pool_size: int | None = None,
+    expected_inference_world_size: int | None = None,
 ) -> InferencePool:
     """Create an inference pool from config (static or elastic)."""
     if client_config.is_elastic:
@@ -208,6 +211,19 @@ async def setup_inference_pool(
             eval_client_type=eval_client_type,
             renderer_config=renderer_config,
             pool_size=pool_size,
+        )
+
+    if client_config.is_dynamo:
+        from prime_rl.utils.dynamo import DynamoInferencePool
+
+        return await DynamoInferencePool.from_config(
+            client_config,
+            model_name=model_name,
+            train_client_type=train_client_type,
+            eval_client_type=eval_client_type,
+            renderer_config=renderer_config,
+            pool_size=pool_size,
+            expected_inference_world_size=cast(int, expected_inference_world_size),
         )
 
     return StaticInferencePool(
