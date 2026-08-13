@@ -305,7 +305,6 @@ class Orchestrator:
                 config.weight_broadcast.port,
                 config.weight_broadcast.timeout,
                 inference_world_size=config.weight_broadcast.inference_world_size,
-                quantize_in_weight_transfer=config.weight_broadcast.quantize_in_weight_transfer,
             )
         elif config.weight_broadcast.type == "nixl":
             await init_nixl_broadcast(
@@ -374,9 +373,7 @@ class Orchestrator:
                 weights_path,
                 lora_name=self.lora_name,
                 step=sync_version,
-                native_nccl=(
-                    config.weight_broadcast.type == "nccl" and not config.weight_broadcast.quantize_in_weight_transfer
-                ),
+                native_nccl=config.weight_broadcast.type == "nccl",
             )
             if self.model_express is not None:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
