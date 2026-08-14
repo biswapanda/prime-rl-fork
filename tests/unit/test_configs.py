@@ -269,7 +269,7 @@ def test_external_dynamo_configures_native_trainer_client():
     assert config.trainer.weight_broadcast.dynamo.model_name == "Qwen/Qwen3-0.6B"
 
 
-def test_client_config_identifies_dynamo_without_rejecting_admin_override():
+def test_client_config_identifies_dynamo_with_admin_urls():
     config = ClientConfig(
         dynamo={"discovery_url": "http://frontend:8001"},
         admin_base_url=["http://worker:8000"],

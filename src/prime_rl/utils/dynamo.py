@@ -160,16 +160,14 @@ class DynamoInferencePool(InferencePool):
         self._weight_update_timeout = client_config.wait_for_ready_timeout
         self._weight_transfer_mode = "collective_rpc"
         self._frontend_clients = setup_admin_clients(client_config.model_copy(update={"admin_base_url": None}))
-        collective_urls = client_config.admin_base_url or [
-            worker.admin_base_url for worker in workers if worker.admin_base_url is not None
-        ]
+        collective_urls = [worker.admin_base_url for worker in workers if worker.admin_base_url is not None]
         self._collective_clients = (
             setup_admin_clients(client_config.model_copy(update={"admin_base_url": collective_urls}))
             if collective_urls
             else []
         )
         super().__init__(
-            client_config,
+            client_config.model_copy(update={"admin_base_url": None}),
             model_name,
             admin_clients=setup_admin_clients(
                 client_config.model_copy(update={"admin_base_url": [worker.system_url for worker in workers]})
