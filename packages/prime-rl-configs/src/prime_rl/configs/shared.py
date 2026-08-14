@@ -172,12 +172,6 @@ class ClientConfig(BaseConfig):
     dynamo_discovery_url: str | None = None
     """Dynamo frontend URL used to discover native vLLM-Rust control endpoints."""
 
-    @model_validator(mode="after")
-    def validate_dynamo_discovery(self):
-        if self.dynamo_discovery_url is not None and self.admin_base_url is not None:
-            raise ValueError("dynamo_discovery_url cannot be combined with admin_base_url")
-        return self
-
 
 class LogConfig(BaseConfig):
     level: str = Field(default_factory=lambda: os.environ.get("PRIME_LOG_LEVEL", "info"))
