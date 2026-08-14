@@ -11,6 +11,7 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import ClientConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli, dump_resolved_config
@@ -242,6 +243,77 @@ def test_single_node_auto_inference_ports_follow_server_port():
     assert config.inference.vllm.data_parallel_size == 2
     assert config.inference.backend_port == 8101
     assert config.orchestrator.model.client.admin_base_url == ["http://localhost:8101/v1"]
+
+
+def test_external_dynamo_configures_native_trainer_client():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {
+                "model": {
+                    "client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}},
+                }
+            },
+            "weight_broadcast": {"type": "nccl"},
+            "deployment": {
+                "type": "single_node",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 0,
+            },
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.dynamo is not None
+    assert config.trainer.weight_broadcast.dynamo.discovery_url == "http://dynamo-frontend:8001"
+    assert config.trainer.weight_broadcast.dynamo.model_name == "Qwen/Qwen3-0.6B"
+
+
+def test_client_config_identifies_dynamo_with_admin_urls():
+    config = ClientConfig(
+        dynamo={"discovery_url": "http://frontend:8001"},
+        admin_base_url=["http://worker:8000"],
+    )
+
+    assert config.is_dynamo()
+    assert config.dynamo is not None
+    assert config.dynamo.discovery_url == "http://frontend:8001"
+    assert not ClientConfig().is_dynamo()
+
+
+def test_external_dynamo_allows_filesystem_weight_transfer():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {
+                "model": {
+                    "client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}},
+                }
+            },
+            "weight_broadcast": {"type": "filesystem"},
+            "deployment": {
+                "type": "single_node",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 0,
+            },
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "filesystem"
+    assert config.orchestrator.weight_broadcast.type == "filesystem"
+
+
+def test_external_dynamo_rejects_nixl_weight_transfer():
+    with pytest.raises(ValueError, match="quantized NCCL and NIXL"):
+        RLConfig.model_validate(
+            {
+                "trainer": {},
+                "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
+                "weight_broadcast": {"type": "nixl"},
+                "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 1},
+                "inference": {"vllm": {"tensor_parallel_size": 1, "data_parallel_size": 1}},
+            }
+        )
 
 
 def test_multi_node_auto_inference_parallelism():

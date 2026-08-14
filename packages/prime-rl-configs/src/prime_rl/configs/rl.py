@@ -347,6 +347,8 @@ class RLConfig(BaseConfig):
     def validate_enough_devices_for_nccl(self):
         if self.deployment.type == "single_node":
             if self.trainer.weight_broadcast.type == "nccl":
+                if self.orchestrator.model.client.is_dynamo():
+                    return self
                 if self.deployment.num_train_gpus + self.deployment.num_infer_gpus < 2:
                     raise ValueError(
                         "NCCL weight broadcast requires at least 2 GPUs to build the broadcast process group."
@@ -458,6 +460,14 @@ class RLConfig(BaseConfig):
                 "LoRA training is not yet supported with in-memory weight broadcast. "
                 "Set weight_broadcast.type = 'filesystem'."
             )
+        client = self.orchestrator.model.client
+        if client.is_dynamo() and (
+            self.weight_broadcast.type == "nixl" or getattr(self.weight_broadcast, "quantize_in_weight_transfer", False)
+        ):
+            raise ValueError(
+                "Dynamo currently supports native NCCL and filesystem weight updates; "
+                "quantized NCCL and NIXL are not supported."
+            )
         if self.weight_broadcast.type in ("nccl", "nixl"):
             inference_world_size = (
                 self.inference.vllm.data_parallel_size * self.inference.vllm.tensor_parallel_size
@@ -474,13 +484,26 @@ class RLConfig(BaseConfig):
                 transport_config = dict(
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
+                trainer_extra = {}
+                if client.is_dynamo():
+                    assert client.dynamo is not None
+                    trainer_extra.update(
+                        dynamo={
+                            "discovery_url": client.dynamo.discovery_url,
+                            "model_name": self.trainer.model.name,
+                            "headers": client.headers,
+                            "headers_from_env": client.headers_from_env,
+                            "api_key_var": client.api_key_var,
+                        },
+                    )
                 trainer_config_type = TrainerNCCLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNCCLWeightBroadcastConfig
             else:
                 transport_config = dict(session_id=self.weight_broadcast.session_id)
+                trainer_extra = {}
                 trainer_config_type = TrainerNIXLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNIXLWeightBroadcastConfig
-            self.trainer.weight_broadcast = trainer_config_type(**common_config, **transport_config)
+            self.trainer.weight_broadcast = trainer_config_type(**common_config, **transport_config, **trainer_extra)
             self.orchestrator.weight_broadcast = orchestrator_config_type(**common_config, **transport_config)
         elif self.weight_broadcast.type == "filesystem":
             self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
