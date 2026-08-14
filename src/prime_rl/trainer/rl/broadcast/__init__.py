@@ -19,7 +19,7 @@ def setup_weight_broadcast(
     lora_config: LoRAConfig | None = None,
 ) -> WeightBroadcast:
     if config.type == "nccl":
-        if config.dynamo is not None:
+        if config.dynamo is not None and not config.quantize_in_weight_transfer:
             from prime_rl.trainer.rl.broadcast.dynamo_nccl import DynamoNCCLWeightBroadcast
 
             return DynamoNCCLWeightBroadcast(output_dir, config, torch.cuda.current_device())

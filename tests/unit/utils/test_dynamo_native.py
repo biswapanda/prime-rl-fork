@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -14,7 +15,7 @@ from prime_rl.utils.dynamo import (
 )
 
 
-def worker(component: str, instance_id: int, world_size: int = 1) -> dict:
+def worker(component: str, instance_id: int, world_size: int = 1, *, admin_base_url: str | None = None) -> dict:
     return {
         "namespace": "dynamo",
         "component": component,
@@ -24,6 +25,7 @@ def worker(component: str, instance_id: int, world_size: int = 1) -> dict:
         "world_size": world_size,
         "weight_transfer_backend": "nccl",
         "routes": sorted(REQUIRED_ROUTES),
+        "admin_base_url": admin_base_url,
     }
 
 
@@ -44,6 +46,17 @@ def test_parse_dynamo_workers_preserves_heterogeneous_topology():
         "Qwen/Qwen3-0.6B",
     )
     assert [(item.component, item.world_size) for item in workers] == [("decode", 4), ("prefill", 2)]
+
+
+def test_parse_dynamo_workers_preserves_collective_rpc_endpoint():
+    workers = parse_dynamo_workers(
+        {
+            "protocol_version": 1,
+            "workers": [worker("backend", 1, admin_base_url="http://backend-1:8120")],
+        },
+        "Qwen/Qwen3-0.6B",
+    )
+    assert workers[0].admin_base_url == "http://backend-1:8120"
 
 
 def test_parse_dynamo_workers_waits_for_complete_capabilities():
@@ -141,3 +154,60 @@ async def test_dynamo_update_fails_closed_when_pause_is_not_confirmed(tmp_path):
         await pool._admin_clients[0].aclose()
 
     assert "/engine/control/resume_generation" not in paths
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_initialization_preserves_engine_rank_spans():
+    requests: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.host or "", json.loads(request.content)))
+        return httpx.Response(200, json={"results": [None]})
+
+    pool = object.__new__(DynamoInferencePool)
+    pool.workers = (
+        DynamoWorker.model_validate(worker("prefill", 3, 2, admin_base_url="http://prefill-3:8120")),
+        DynamoWorker.model_validate(worker("decode", 9, 4, admin_base_url="http://decode-9:8120")),
+    )
+    pool._collective_clients = [
+        httpx.AsyncClient(base_url=item.admin_base_url, transport=httpx.MockTransport(handler)) for item in pool.workers
+    ]
+    try:
+        await pool.init_nccl_broadcast(
+            host="trainer",
+            port=29501,
+            timeout=1200,
+            inference_world_size=6,
+            quantize_in_weight_transfer=True,
+        )
+    finally:
+        await asyncio.gather(*(client.aclose() for client in pool._collective_clients))
+
+    assert sorted((host, body["kwargs"]["rank_offset"]) for host, body in requests) == [
+        ("decode-9", 2),
+        ("prefill-3", 0),
+    ]
+    assert {body["method"] for _, body in requests} == {"init_broadcaster"}
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_updates_prime_worker_extension(tmp_path):
+    requests: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, json.loads(request.content or b"{}")))
+        return httpx.Response(200, json={"results": [None]})
+
+    pool = object.__new__(DynamoInferencePool)
+    pool.workers = (DynamoWorker.model_validate(worker("backend", 1, admin_base_url="http://worker:8120")),)
+    pool._weight_transfer_mode = "collective_rpc"
+    pool._collective_clients = [
+        httpx.AsyncClient(base_url="http://worker:8120", transport=httpx.MockTransport(handler))
+    ]
+    try:
+        await pool.update_weights(tmp_path, step=2)
+    finally:
+        await pool._collective_clients[0].aclose()
+
+    assert [path for path, _ in requests] == ["/pause", "/collective_rpc", "/resume"]
+    assert requests[1][1] == {"method": "update_weights_from_path", "args": [tmp_path.as_posix()]}

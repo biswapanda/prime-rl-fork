@@ -461,11 +461,6 @@ class RLConfig(BaseConfig):
                 "Set weight_broadcast.type = 'filesystem'."
             )
         client = self.orchestrator.model.client
-        if client.dynamo_discovery_url is not None:
-            if self.weight_broadcast.type != "nccl":
-                raise ValueError("Dynamo native weight transfer currently requires weight_broadcast.type = 'nccl'.")
-            if self.weight_broadcast.quantize_in_weight_transfer:
-                raise ValueError("Dynamo native weight transfer does not support quantize_in_weight_transfer yet.")
         if self.weight_broadcast.type in ("nccl", "nixl"):
             inference_world_size = (
                 self.inference.vllm.data_parallel_size * self.inference.vllm.tensor_parallel_size

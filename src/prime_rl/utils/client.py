@@ -143,7 +143,7 @@ async def setup_inference_pool(
     train_client_type: str = "openai_chat_completions",
     eval_client_type: str = "openai_chat_completions",
     renderer_config: RendererConfig | None = None,
-    expected_world_size: int = 1,
+    inference_world_size: int = 1,
 ) -> InferencePool:
     kwargs = {
         "train_client_type": train_client_type,
@@ -156,7 +156,7 @@ async def setup_inference_pool(
         return await DynamoInferencePool.from_config(
             client_config,
             model_name,
-            expected_world_size=expected_world_size,
+            inference_world_size=inference_world_size,
             **kwargs,
         )
     return InferencePool(client_config, model_name, **kwargs)
@@ -340,6 +340,8 @@ async def update_weights(
     weight_dir: Path | None,
     lora_name: str | None = None,
     step: int = 0,
+    *,
+    use_collective_rpc: bool = False,
 ) -> None:
     """Update weights on static inference servers.
 
@@ -369,12 +371,18 @@ async def update_weights(
                 nccl_ready_file.touch()
                 logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
 
+            path = "/collective_rpc" if use_collective_rpc else "/update_weights"
+            payload = (
+                {"method": "update_weights_from_path", "args": [weight_dir_posix]}
+                if use_collective_rpc
+                else {"weight_dir": weight_dir_posix}
+            )
             await asyncio.gather(
                 *[
                     _admin_post(
                         admin_client,
-                        "/update_weights",
-                        json={"weight_dir": weight_dir_posix},
+                        path,
+                        json=payload,
                         timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
                     )
                     for admin_client in admin_clients
@@ -459,6 +467,9 @@ async def init_nccl_broadcast(
     timeout: int,
     inference_world_size: int | None = None,
     quantize_in_weight_transfer: bool = False,
+    *,
+    engine_world_sizes: list[int] | None = None,
+    use_collective_rpc: bool = False,
 ) -> None:
     """Initialize NCCL broadcast on all inference servers.
 
@@ -468,42 +479,60 @@ async def init_nccl_broadcast(
     """
     logger = get_logger()
 
+    explicit_engine_world_sizes = engine_world_sizes is not None
     if inference_world_size is None:
-        inference_world_size = len(admin_clients)
+        inference_world_size = sum(engine_world_sizes) if engine_world_sizes is not None else len(admin_clients)
         logger.warning(
             f"inference_world_size not provided, defaulting to {inference_world_size} (one GPU per admin client)"
         )
 
-    gpus_per_server = inference_world_size // len(admin_clients)
+    if engine_world_sizes is None:
+        if inference_world_size % len(admin_clients) != 0:
+            raise ValueError("inference_world_size must be divisible by the number of admin clients")
+        engine_world_sizes = [inference_world_size // len(admin_clients)] * len(admin_clients)
+    rank_offsets = _rank_offsets(engine_world_sizes, inference_world_size)
 
     logger.info(
         f"Initializing NCCL broadcast: {len(admin_clients)} servers, "
-        f"inference_world_size={inference_world_size}, gpus_per_server={gpus_per_server}"
+        f"inference_world_size={inference_world_size}, engine_world_sizes={engine_world_sizes}"
     )
 
-    async def _init_nccl_broadcast(admin_client: AsyncClient, rank_offset: int) -> None:
+    async def _init_nccl_broadcast(
+        admin_client: AsyncClient,
+        rank_offset: int,
+        engine_world_size: int,
+    ) -> None:
+        payload = {
+            "host": host,
+            "port": port,
+            "rank_offset": rank_offset,
+            "inference_world_size": inference_world_size,
+            "timeout": timeout,
+            "quantize_in_weight_transfer": quantize_in_weight_transfer,
+        }
+        if explicit_engine_world_sizes:
+            payload["engine_world_size"] = engine_world_size
         try:
             response = await admin_client.post(
-                "/init_broadcaster",
-                json={
-                    "host": host,
-                    "port": port,
-                    "rank_offset": rank_offset,
-                    "inference_world_size": inference_world_size,
-                    "timeout": timeout,
-                    "quantize_in_weight_transfer": quantize_in_weight_transfer,
-                },
+                "/collective_rpc" if use_collective_rpc else "/init_broadcaster",
+                json={"method": "init_broadcaster", "kwargs": payload} if use_collective_rpc else payload,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
+            if not use_collective_rpc and e.response.status_code == 404:
                 logger.warning("The route /init_broadcaster does not exist. Skipping NCCL broadcast initialization.")
                 return
+            raise
 
     await asyncio.gather(
         *[
-            _init_nccl_broadcast(admin_client, client_num * gpus_per_server)
-            for client_num, admin_client in enumerate(admin_clients)
+            _init_nccl_broadcast(admin_client, rank_offset, engine_world_size)
+            for admin_client, rank_offset, engine_world_size in zip(
+                admin_clients,
+                rank_offsets,
+                engine_world_sizes,
+                strict=True,
+            )
         ]
     )
 
@@ -515,29 +544,63 @@ async def init_nixl_broadcast(
     timeout: int,
     inference_world_size: int,
     session_id: str,
+    *,
+    engine_world_sizes: list[int] | None = None,
+    use_collective_rpc: bool = False,
 ) -> None:
     """Configure every vLLM worker for NIXL + ModelExpress pulls."""
-    workers_per_server = inference_world_size // len(admin_clients)
+    explicit_engine_world_sizes = engine_world_sizes is not None
+    if engine_world_sizes is None:
+        if inference_world_size % len(admin_clients) != 0:
+            raise ValueError("inference_world_size must be divisible by the number of admin clients")
+        engine_world_sizes = [inference_world_size // len(admin_clients)] * len(admin_clients)
+    rank_offsets = _rank_offsets(engine_world_sizes, inference_world_size)
 
-    async def initialize(admin_client: AsyncClient, rank_offset: int) -> None:
+    async def initialize(admin_client: AsyncClient, rank_offset: int, engine_world_size: int) -> None:
+        payload = {
+            "host": host,
+            "port": port,
+            "rank_offset": rank_offset,
+            "inference_world_size": inference_world_size,
+            "timeout": timeout,
+            "quantize_in_weight_transfer": False,
+            "session_id": session_id,
+        }
+        if explicit_engine_world_sizes:
+            payload["engine_world_size"] = engine_world_size
+        path = "/collective_rpc" if use_collective_rpc else "/init_broadcaster"
+        body = {"method": "init_broadcaster", "kwargs": payload} if use_collective_rpc else payload
         await _admin_post(
             admin_client,
-            "/init_broadcaster",
+            path,
             timeout_s=max(ADMIN_TIMEOUT_S, timeout),
-            json={
-                "host": host,
-                "port": port,
-                "rank_offset": rank_offset,
-                "inference_world_size": inference_world_size,
-                "timeout": timeout,
-                "quantize_in_weight_transfer": False,
-                "session_id": session_id,
-            },
+            json=body,
         )
 
     await asyncio.gather(
-        *[initialize(admin_client, index * workers_per_server) for index, admin_client in enumerate(admin_clients)]
+        *[
+            initialize(admin_client, rank_offset, engine_world_size)
+            for admin_client, rank_offset, engine_world_size in zip(
+                admin_clients,
+                rank_offsets,
+                engine_world_sizes,
+                strict=True,
+            )
+        ]
     )
+
+
+def _rank_offsets(engine_world_sizes: list[int], inference_world_size: int) -> list[int]:
+    if not engine_world_sizes or any(isinstance(size, bool) or size <= 0 for size in engine_world_sizes):
+        raise ValueError("engine world sizes must be positive integers")
+    if sum(engine_world_sizes) != inference_world_size:
+        raise ValueError("engine world sizes do not match inference_world_size")
+    offsets: list[int] = []
+    offset = 0
+    for world_size in engine_world_sizes:
+        offsets.append(offset)
+        offset += world_size
+    return offsets
 
 
 async def prefill_logprobs(openai: AsyncOpenAI, model: str, token_ids: list[int]) -> list[float]:

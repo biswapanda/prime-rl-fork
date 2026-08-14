@@ -45,7 +45,7 @@ async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
         train_client_type="renderer",
         eval_client_type="openai_chat_completions",
         renderer_config=config.renderer,
-        expected_world_size=config.weight_broadcast.inference_world_size
+        inference_world_size=config.weight_broadcast.inference_world_size
         if config.weight_broadcast.type in ("nccl", "nixl")
         else 1,
     )

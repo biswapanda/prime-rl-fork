@@ -14,8 +14,11 @@ from prime_rl.utils.client import (
     NCCL_READY_MARKER,
     InferencePool,
     check_health,
+    init_nccl_broadcast,
+    init_nixl_broadcast,
     maybe_check_has_model,
     setup_admin_clients,
+    update_weights,
 )
 from prime_rl.utils.logger import get_logger
 
@@ -42,6 +45,7 @@ class DynamoWorker(BaseModel):
     instance_id: int = Field(ge=0, strict=True)
     model: str = Field(min_length=1)
     system_url: str = Field(min_length=1)
+    admin_base_url: str | None = Field(default=None, min_length=1)
     world_size: int = Field(gt=0, strict=True)
     weight_transfer_backend: str = Field(min_length=1)
     routes: tuple[str, ...]
@@ -106,13 +110,16 @@ def parse_dynamo_workers(payload: object, model_name: str) -> tuple[DynamoWorker
     return tuple(sorted(workers, key=lambda worker: (worker.namespace, worker.component, worker.instance_id)))
 
 
-def topology_fingerprint(workers: tuple[DynamoWorker, ...]) -> tuple[tuple[str, str, int, str, int, str], ...]:
+def topology_fingerprint(
+    workers: tuple[DynamoWorker, ...],
+) -> tuple[tuple[str, str, int, str, str | None, int, str], ...]:
     return tuple(
         (
             worker.namespace,
             worker.component,
             worker.instance_id,
             worker.system_url.rstrip("/"),
+            worker.admin_base_url.rstrip("/") if worker.admin_base_url is not None else None,
             worker.world_size,
             worker.weight_transfer_backend,
         )
@@ -133,15 +140,18 @@ def discover_dynamo_workers(
     return parse_dynamo_workers(response.json(), model_name)
 
 
-def _control_clients(workers: tuple[DynamoWorker, ...], headers: dict[str, str]) -> list[httpx.AsyncClient]:
+def _control_clients(
+    urls: list[str],
+    headers: dict[str, str],
+) -> list[httpx.AsyncClient]:
     return [
         httpx.AsyncClient(
-            base_url=worker.system_url.rstrip("/"),
+            base_url=url.rstrip("/"),
             headers=headers,
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=1),
             timeout=httpx.Timeout(None),
         )
-        for worker in workers
+        for url in urls
     ]
 
 
@@ -171,11 +181,16 @@ class DynamoInferencePool(InferencePool):
         )
         self.workers = workers
         self._weight_update_timeout = client_config.wait_for_ready_timeout
+        self._weight_transfer_mode = "collective_rpc"
         self._frontend_clients = setup_admin_clients(client_config.model_copy(update={"admin_base_url": None}))
+        self._collective_clients = _control_clients(
+            [worker.admin_base_url for worker in workers if worker.admin_base_url is not None],
+            headers,
+        )
         super().__init__(
             client_config,
             model_name,
-            admin_clients=_control_clients(workers, headers),
+            admin_clients=_control_clients([worker.system_url for worker in workers], headers),
             **kwargs,
         )
 
@@ -185,7 +200,7 @@ class DynamoInferencePool(InferencePool):
         client_config: ClientConfig,
         model_name: str,
         *,
-        expected_world_size: int,
+        inference_world_size: int,
         **kwargs,
     ) -> DynamoInferencePool:
         if client_config.dynamo_discovery_url is None:
@@ -208,9 +223,10 @@ class DynamoInferencePool(InferencePool):
                     timeout=min(30.0, max(1.0, deadline - time.monotonic())),
                 )
                 discovered_world_size = sum(worker.world_size for worker in workers)
-                if discovered_world_size != expected_world_size:
+                if discovered_world_size != inference_world_size:
                     raise DynamoDiscoveryPending(
-                        f"Dynamo world size {discovered_world_size} does not match expected {expected_world_size}"
+                        f"Dynamo world size {discovered_world_size} does not match Prime inference capacity "
+                        f"{inference_world_size}"
                     )
                 fingerprint = topology_fingerprint(workers)
                 if fingerprint == previous_fingerprint:
@@ -243,21 +259,64 @@ class DynamoInferencePool(InferencePool):
         inference_world_size: int | None,
         quantize_in_weight_transfer: bool,
     ) -> None:
-        if quantize_in_weight_transfer:
-            raise ValueError("Dynamo native NCCL does not support quantized transfer")
         discovered_world_size = sum(worker.world_size for worker in self.workers)
         if inference_world_size is not None and inference_world_size != discovered_world_size:
             raise ValueError(
                 f"Configured inference_world_size={inference_world_size} does not match Dynamo "
                 f"world size {discovered_world_size}"
             )
+        if quantize_in_weight_transfer:
+            clients = self._require_collective_clients()
+            self._weight_transfer_mode = "collective_rpc"
+            await init_nccl_broadcast(
+                clients,
+                host=host,
+                port=port,
+                timeout=timeout,
+                inference_world_size=discovered_world_size,
+                quantize_in_weight_transfer=True,
+                engine_world_sizes=[worker.world_size for worker in self.workers],
+                use_collective_rpc=True,
+            )
+            return
+
         self._weight_update_timeout = timeout
+        self._weight_transfer_mode = "native"
         get_logger().info(f"Dynamo trainer owns native NCCL initialization for {discovered_world_size} ranks")
 
-    async def init_nixl_broadcast(self, **kwargs) -> None:
-        raise ValueError("Dynamo native NIXL transfer is not supported yet")
+    async def init_nixl_broadcast(
+        self,
+        *,
+        host: str,
+        port: int,
+        timeout: int,
+        inference_world_size: int,
+        session_id: str,
+    ) -> None:
+        clients = self._require_collective_clients()
+        self._weight_transfer_mode = "collective_rpc"
+        await init_nixl_broadcast(
+            clients,
+            host,
+            port,
+            timeout,
+            inference_world_size,
+            session_id,
+            engine_world_sizes=[worker.world_size for worker in self.workers],
+            use_collective_rpc=True,
+        )
 
     async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
+        if getattr(self, "_weight_transfer_mode", "native") == "collective_rpc":
+            if lora_name is not None:
+                raise ValueError("Dynamo collective RPC weight transfer does not support LoRA updates")
+            await update_weights(
+                self._require_collective_clients(),
+                weight_dir,
+                step=step,
+                use_collective_rpc=True,
+            )
+            return
         if lora_name is not None or weight_dir is None:
             raise ValueError("Dynamo native integration currently supports full-model NCCL updates only")
 
@@ -295,4 +354,13 @@ class DynamoInferencePool(InferencePool):
 
     async def stop(self) -> None:
         await super().stop()
-        await asyncio.gather(*(client.aclose() for client in [*self._admin_clients, *self._frontend_clients]))
+        await asyncio.gather(
+            *(client.aclose() for client in [*self._admin_clients, *self._frontend_clients, *self._collective_clients])
+        )
+
+    def _require_collective_clients(self) -> list[httpx.AsyncClient]:
+        if len(self._collective_clients) != len(self.workers):
+            raise ValueError(
+                "Dynamo workers must advertise a vLLM HTTP endpoint for Prime collective RPC weight transfer"
+            )
+        return self._collective_clients
