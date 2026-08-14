@@ -150,7 +150,7 @@ async def setup_inference_pool(
         "eval_client_type": eval_client_type,
         "renderer_config": renderer_config,
     }
-    if client_config.dynamo_discovery_url is not None:
+    if client_config.is_dynamo():
         from prime_rl.utils.dynamo import DynamoInferencePool
 
         return await DynamoInferencePool.from_config(

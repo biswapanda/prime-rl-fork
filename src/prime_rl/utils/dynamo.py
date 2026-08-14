@@ -137,21 +137,6 @@ def discover_dynamo_workers(
     return parse_dynamo_workers(response.json(), model_name)
 
 
-def _control_clients(
-    urls: list[str],
-    headers: dict[str, str],
-) -> list[httpx.AsyncClient]:
-    return [
-        httpx.AsyncClient(
-            base_url=url.rstrip("/"),
-            headers=headers,
-            limits=httpx.Limits(max_connections=4, max_keepalive_connections=1),
-            timeout=httpx.Timeout(None),
-        )
-        for url in urls
-    ]
-
-
 async def _post(client: httpx.AsyncClient, path: str, body: dict[str, Any]) -> dict[str, Any]:
     response = await client.post(path, json=body)
     response.raise_for_status()
@@ -171,23 +156,24 @@ class DynamoInferencePool(InferencePool):
         model_name: str,
         **kwargs,
     ) -> None:
-        headers = client_headers(
-            client_config.headers,
-            client_config.headers_from_env,
-            client_config.api_key_var,
-        )
         self.workers = workers
         self._weight_update_timeout = client_config.wait_for_ready_timeout
         self._weight_transfer_mode = "collective_rpc"
         self._frontend_clients = setup_admin_clients(client_config.model_copy(update={"admin_base_url": None}))
-        self._collective_clients = _control_clients(
-            [worker.admin_base_url for worker in workers if worker.admin_base_url is not None],
-            headers,
+        collective_urls = client_config.admin_base_url or [
+            worker.admin_base_url for worker in workers if worker.admin_base_url is not None
+        ]
+        self._collective_clients = (
+            setup_admin_clients(client_config.model_copy(update={"admin_base_url": collective_urls}))
+            if collective_urls
+            else []
         )
         super().__init__(
             client_config,
             model_name,
-            admin_clients=_control_clients([worker.system_url for worker in workers], headers),
+            admin_clients=setup_admin_clients(
+                client_config.model_copy(update={"admin_base_url": [worker.system_url for worker in workers]})
+            ),
             **kwargs,
         )
 
@@ -200,8 +186,8 @@ class DynamoInferencePool(InferencePool):
         inference_world_size: int,
         **kwargs,
     ) -> DynamoInferencePool:
-        if client_config.dynamo_discovery_url is None:
-            raise ValueError("dynamo_discovery_url is required")
+        if client_config.dynamo is None:
+            raise ValueError("Dynamo configuration is required")
         headers = client_headers(
             client_config.headers,
             client_config.headers_from_env,
@@ -214,7 +200,7 @@ class DynamoInferencePool(InferencePool):
             try:
                 workers = await asyncio.to_thread(
                     discover_dynamo_workers,
-                    client_config.dynamo_discovery_url,
+                    client_config.dynamo.discovery_url,
                     model_name,
                     headers=headers,
                     timeout=min(30.0, max(1.0, deadline - time.monotonic())),

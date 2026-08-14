@@ -6,6 +6,7 @@ from pydantic import Field, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
+    DynamoConfig,
     EnvVars,
     FileMonitorConfig,
     HeartbeatConfig,
@@ -534,8 +535,7 @@ class InMemoryWeightBroadcastConfig(BaseWeightBroadcastConfig):
     """Number of inference workers."""
 
 
-class DynamoWeightBroadcastConfig(BaseConfig):
-    discovery_url: str
+class DynamoWeightBroadcastConfig(DynamoConfig):
     model_name: str
     headers: dict[str, str] = {}
     headers_from_env: dict[str, str] = {}

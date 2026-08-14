@@ -3,7 +3,6 @@ import json
 import httpx
 import pytest
 
-from prime_rl.configs.shared import ClientConfig
 from prime_rl.trainer.rl.broadcast.dynamo_nccl import DynamoVLLMWeightSyncClient
 from prime_rl.utils.dynamo import (
     REQUIRED_ROUTES,
@@ -26,14 +25,6 @@ def worker(component: str, instance_id: int, world_size: int = 1, *, admin_base_
         "routes": sorted(REQUIRED_ROUTES),
         "admin_base_url": admin_base_url,
     }
-
-
-def test_client_config_rejects_two_admin_discovery_modes():
-    with pytest.raises(ValueError, match="cannot be combined"):
-        ClientConfig(
-            dynamo_discovery_url="http://frontend:8001",
-            admin_base_url=["http://worker:8000"],
-        )
 
 
 def test_parse_dynamo_workers_preserves_heterogeneous_topology():

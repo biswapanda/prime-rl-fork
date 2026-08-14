@@ -11,6 +11,7 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import ClientConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli, dump_resolved_config
@@ -250,7 +251,7 @@ def test_external_dynamo_configures_native_trainer_client():
             "trainer": {},
             "orchestrator": {
                 "model": {
-                    "client": {"dynamo_discovery_url": "http://dynamo-frontend:8001"},
+                    "client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}},
                 }
             },
             "weight_broadcast": {"type": "nccl"},
@@ -268,13 +269,25 @@ def test_external_dynamo_configures_native_trainer_client():
     assert config.trainer.weight_broadcast.dynamo.model_name == "Qwen/Qwen3-0.6B"
 
 
+def test_client_config_identifies_dynamo_without_rejecting_admin_override():
+    config = ClientConfig(
+        dynamo={"discovery_url": "http://frontend:8001"},
+        admin_base_url=["http://worker:8000"],
+    )
+
+    assert config.is_dynamo()
+    assert config.dynamo is not None
+    assert config.dynamo.discovery_url == "http://frontend:8001"
+    assert not ClientConfig().is_dynamo()
+
+
 def test_external_dynamo_allows_filesystem_weight_transfer():
     config = RLConfig.model_validate(
         {
             "trainer": {},
             "orchestrator": {
                 "model": {
-                    "client": {"dynamo_discovery_url": "http://dynamo-frontend:8001"},
+                    "client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}},
                 }
             },
             "weight_broadcast": {"type": "filesystem"},
@@ -295,7 +308,7 @@ def test_external_dynamo_rejects_nixl_weight_transfer():
         RLConfig.model_validate(
             {
                 "trainer": {},
-                "orchestrator": {"model": {"client": {"dynamo_discovery_url": "http://dynamo-frontend:8001"}}},
+                "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
                 "weight_broadcast": {"type": "nixl"},
                 "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 1},
                 "inference": {"vllm": {"tensor_parallel_size": 1, "data_parallel_size": 1}},

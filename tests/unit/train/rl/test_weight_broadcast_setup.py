@@ -19,7 +19,7 @@ def test_standard_dynamo_nccl_uses_native_transfer(tmp_path):
     with (
         patch("torch.cuda.current_device", return_value=0),
         patch(
-            "prime_rl.trainer.rl.broadcast.dynamo_nccl.DynamoNCCLWeightBroadcast",
+            "prime_rl.trainer.rl.broadcast.DynamoNCCLWeightBroadcast",
             return_value=expected,
         ),
     ):

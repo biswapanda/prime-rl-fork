@@ -347,7 +347,7 @@ class RLConfig(BaseConfig):
     def validate_enough_devices_for_nccl(self):
         if self.deployment.type == "single_node":
             if self.trainer.weight_broadcast.type == "nccl":
-                if self.orchestrator.model.client.dynamo_discovery_url is not None:
+                if self.orchestrator.model.client.is_dynamo():
                     return self
                 if self.deployment.num_train_gpus + self.deployment.num_infer_gpus < 2:
                     raise ValueError(
@@ -461,7 +461,7 @@ class RLConfig(BaseConfig):
                 "Set weight_broadcast.type = 'filesystem'."
             )
         client = self.orchestrator.model.client
-        if client.dynamo_discovery_url is not None and (
+        if client.is_dynamo() and (
             self.weight_broadcast.type == "nixl" or getattr(self.weight_broadcast, "quantize_in_weight_transfer", False)
         ):
             raise ValueError(
@@ -485,10 +485,11 @@ class RLConfig(BaseConfig):
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
                 trainer_extra = {}
-                if client.dynamo_discovery_url is not None:
+                if client.is_dynamo():
+                    assert client.dynamo is not None
                     trainer_extra.update(
                         dynamo={
-                            "discovery_url": client.dynamo_discovery_url,
+                            "discovery_url": client.dynamo.discovery_url,
                             "model_name": self.trainer.model.name,
                             "headers": client.headers,
                             "headers_from_env": client.headers_from_env,
