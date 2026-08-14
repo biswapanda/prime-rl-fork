@@ -143,7 +143,7 @@ async def setup_inference_pool(
     train_client_type: str = "openai_chat_completions",
     eval_client_type: str = "openai_chat_completions",
     renderer_config: RendererConfig | None = None,
-    inference_world_size: int = 1,
+    inference_world_size: int | None = None,
 ) -> InferencePool:
     kwargs = {
         "train_client_type": train_client_type,

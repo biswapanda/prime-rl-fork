@@ -47,7 +47,7 @@ async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
         renderer_config=config.renderer,
         inference_world_size=config.weight_broadcast.inference_world_size
         if config.weight_broadcast.type in ("nccl", "nixl")
-        else 1,
+        else None,
     )
     return renderer, inference_pool
 

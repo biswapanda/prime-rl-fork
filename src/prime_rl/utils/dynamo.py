@@ -181,7 +181,7 @@ class DynamoInferencePool(InferencePool):
         client_config: ClientConfig,
         model_name: str,
         *,
-        inference_world_size: int,
+        inference_world_size: int | None,
         **kwargs,
     ) -> DynamoInferencePool:
         if client_config.dynamo is None:
@@ -204,7 +204,7 @@ class DynamoInferencePool(InferencePool):
                     timeout=min(30.0, max(1.0, deadline - time.monotonic())),
                 )
                 discovered_world_size = sum(worker.world_size for worker in workers)
-                if discovered_world_size != inference_world_size:
+                if inference_world_size is not None and discovered_world_size != inference_world_size:
                     raise DynamoDiscoveryPending(
                         f"Dynamo world size {discovered_world_size} does not match Prime inference capacity "
                         f"{inference_world_size}"
