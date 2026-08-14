@@ -169,6 +169,15 @@ class ClientConfig(BaseConfig):
     admin_base_url: list[str] | None = None
     """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in multi-replica or disaggregated P/D deployments where the router must not handle admin traffic."""
 
+    dynamo_discovery_url: str | None = None
+    """Dynamo frontend URL used to discover native vLLM-Rust control endpoints."""
+
+    @model_validator(mode="after")
+    def validate_dynamo_discovery(self):
+        if self.dynamo_discovery_url is not None and self.admin_base_url is not None:
+            raise ValueError("dynamo_discovery_url cannot be combined with admin_base_url")
+        return self
+
 
 class LogConfig(BaseConfig):
     level: str = Field(default_factory=lambda: os.environ.get("PRIME_LOG_LEVEL", "info"))

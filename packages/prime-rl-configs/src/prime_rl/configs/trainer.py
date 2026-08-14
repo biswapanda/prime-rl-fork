@@ -534,6 +534,14 @@ class InMemoryWeightBroadcastConfig(BaseWeightBroadcastConfig):
     """Number of inference workers."""
 
 
+class DynamoWeightBroadcastConfig(BaseConfig):
+    discovery_url: str
+    model_name: str
+    headers: dict[str, str] = {}
+    headers_from_env: dict[str, str] = {}
+    api_key_var: str = "VLLM_API_KEY"
+
+
 class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"
 
@@ -542,6 +550,8 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
 
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
+
+    dynamo: DynamoWeightBroadcastConfig | None = None
 
 
 class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):

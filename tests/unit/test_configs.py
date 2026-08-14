@@ -244,6 +244,30 @@ def test_single_node_auto_inference_ports_follow_server_port():
     assert config.orchestrator.model.client.admin_base_url == ["http://localhost:8101/v1"]
 
 
+def test_external_dynamo_configures_native_trainer_client():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {
+                "model": {
+                    "client": {"dynamo_discovery_url": "http://dynamo-frontend:8001"},
+                }
+            },
+            "weight_broadcast": {"type": "nccl"},
+            "deployment": {
+                "type": "single_node",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 0,
+            },
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.dynamo is not None
+    assert config.trainer.weight_broadcast.dynamo.discovery_url == "http://dynamo-frontend:8001"
+    assert config.trainer.weight_broadcast.dynamo.model_name == "Qwen/Qwen3-0.6B"
+
+
 def test_multi_node_auto_inference_parallelism():
     config = RLConfig.model_validate(
         {

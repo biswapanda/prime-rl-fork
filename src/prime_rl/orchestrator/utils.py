@@ -10,7 +10,7 @@ from pathlib import Path
 import orjson
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
-from prime_rl.utils.client import InferencePool
+from prime_rl.utils.client import setup_inference_pool
 from prime_rl.utils.logger import InterceptHandler, get_logger, setup_logger
 from prime_rl.utils.utils import (
     get_broadcast_dir,
@@ -39,12 +39,15 @@ async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
         get_logger().info("Using direct renderer rollout client")
     else:
         get_logger().info("No policy-sourced train env — renderer kept for client-side tokenization only")
-    inference_pool = InferencePool(
+    inference_pool = await setup_inference_pool(
         client_config,
         model_name=model_name,
         train_client_type="renderer",
         eval_client_type="openai_chat_completions",
         renderer_config=config.renderer,
+        expected_world_size=config.weight_broadcast.inference_world_size
+        if config.weight_broadcast.type in ("nccl", "nixl")
+        else 1,
     )
     return renderer, inference_pool
 
