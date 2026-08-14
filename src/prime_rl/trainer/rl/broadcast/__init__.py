@@ -3,6 +3,7 @@ from pathlib import Path
 from prime_rl.configs.trainer import LoRAConfig, WeightBroadcastConfig
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
+from prime_rl.trainer.rl.broadcast.dynamo_nccl import DynamoNCCLWeightBroadcast
 from prime_rl.trainer.rl.broadcast.filesystem import FileSystemWeightBroadcast
 from prime_rl.trainer.rl.broadcast.nccl import NCCLWeightBroadcast
 from prime_rl.trainer.rl.broadcast.nixl import NIXLWeightBroadcast
@@ -15,6 +16,8 @@ def setup_weight_broadcast(
     lora_config: LoRAConfig | None = None,
 ) -> WeightBroadcast:
     if config.type == "nccl":
+        if config.dynamo is not None:
+            return DynamoNCCLWeightBroadcast(output_dir, config)
         return NCCLWeightBroadcast(output_dir, config)
     elif config.type == "filesystem":
         return FileSystemWeightBroadcast(output_dir, config, lora_config)
