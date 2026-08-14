@@ -290,6 +290,19 @@ def test_external_dynamo_allows_filesystem_weight_transfer():
     assert config.orchestrator.weight_broadcast.type == "filesystem"
 
 
+def test_external_dynamo_rejects_nixl_weight_transfer():
+    with pytest.raises(ValueError, match="quantized NCCL and NIXL"):
+        RLConfig.model_validate(
+            {
+                "trainer": {},
+                "orchestrator": {"model": {"client": {"dynamo_discovery_url": "http://dynamo-frontend:8001"}}},
+                "weight_broadcast": {"type": "nixl"},
+                "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 1},
+                "inference": {"vllm": {"tensor_parallel_size": 1, "data_parallel_size": 1}},
+            }
+        )
+
+
 def test_multi_node_auto_inference_parallelism():
     config = RLConfig.model_validate(
         {

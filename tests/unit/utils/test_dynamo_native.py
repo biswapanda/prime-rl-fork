@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 import httpx
@@ -157,40 +156,6 @@ async def test_dynamo_update_fails_closed_when_pause_is_not_confirmed(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_collective_rpc_initialization_preserves_engine_rank_spans():
-    requests: list[tuple[str, dict]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.url.host or "", json.loads(request.content)))
-        return httpx.Response(200, json={"results": [None]})
-
-    pool = object.__new__(DynamoInferencePool)
-    pool.workers = (
-        DynamoWorker.model_validate(worker("prefill", 3, 2, admin_base_url="http://prefill-3:8120")),
-        DynamoWorker.model_validate(worker("decode", 9, 4, admin_base_url="http://decode-9:8120")),
-    )
-    pool._collective_clients = [
-        httpx.AsyncClient(base_url=item.admin_base_url, transport=httpx.MockTransport(handler)) for item in pool.workers
-    ]
-    try:
-        await pool.init_nccl_broadcast(
-            host="trainer",
-            port=29501,
-            timeout=1200,
-            inference_world_size=6,
-            quantize_in_weight_transfer=True,
-        )
-    finally:
-        await asyncio.gather(*(client.aclose() for client in pool._collective_clients))
-
-    assert sorted((host, body["kwargs"]["rank_offset"]) for host, body in requests) == [
-        ("decode-9", 2),
-        ("prefill-3", 0),
-    ]
-    assert {body["method"] for _, body in requests} == {"init_broadcaster"}
-
-
-@pytest.mark.asyncio
 async def test_collective_rpc_updates_prime_worker_extension(tmp_path):
     requests: list[tuple[str, dict]] = []
 
@@ -201,6 +166,7 @@ async def test_collective_rpc_updates_prime_worker_extension(tmp_path):
     pool = object.__new__(DynamoInferencePool)
     pool.workers = (DynamoWorker.model_validate(worker("backend", 1, admin_base_url="http://worker:8120")),)
     pool._weight_transfer_mode = "collective_rpc"
+    pool._weight_update_timeout = 10
     pool._collective_clients = [
         httpx.AsyncClient(base_url="http://worker:8120", transport=httpx.MockTransport(handler))
     ]

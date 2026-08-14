@@ -14,11 +14,8 @@ from prime_rl.utils.client import (
     NCCL_READY_MARKER,
     InferencePool,
     check_health,
-    init_nccl_broadcast,
-    init_nixl_broadcast,
     maybe_check_has_model,
     setup_admin_clients,
-    update_weights,
 )
 from prime_rl.utils.logger import get_logger
 
@@ -266,56 +263,23 @@ class DynamoInferencePool(InferencePool):
                 f"world size {discovered_world_size}"
             )
         if quantize_in_weight_transfer:
-            clients = self._require_collective_clients()
-            self._weight_transfer_mode = "collective_rpc"
-            await init_nccl_broadcast(
-                clients,
-                host=host,
-                port=port,
-                timeout=timeout,
-                inference_world_size=discovered_world_size,
-                quantize_in_weight_transfer=True,
-                engine_world_sizes=[worker.world_size for worker in self.workers],
-                use_collective_rpc=True,
+            raise ValueError(
+                "Dynamo collective RPC does not support quantized NCCL updates yet. "
+                "Use native NCCL or filesystem weight updates."
             )
-            return
 
         self._weight_update_timeout = timeout
         self._weight_transfer_mode = "native"
         get_logger().info(f"Dynamo trainer owns native NCCL initialization for {discovered_world_size} ranks")
 
-    async def init_nixl_broadcast(
-        self,
-        *,
-        host: str,
-        port: int,
-        timeout: int,
-        inference_world_size: int,
-        session_id: str,
-    ) -> None:
-        clients = self._require_collective_clients()
-        self._weight_transfer_mode = "collective_rpc"
-        await init_nixl_broadcast(
-            clients,
-            host,
-            port,
-            timeout,
-            inference_world_size,
-            session_id,
-            engine_world_sizes=[worker.world_size for worker in self.workers],
-            use_collective_rpc=True,
-        )
+    async def init_nixl_broadcast(self, **kwargs: Any) -> None:
+        raise ValueError("Dynamo collective RPC does not support NIXL updates yet.")
 
     async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
         if getattr(self, "_weight_transfer_mode", "native") == "collective_rpc":
             if lora_name is not None:
                 raise ValueError("Dynamo collective RPC weight transfer does not support LoRA updates")
-            await update_weights(
-                self._require_collective_clients(),
-                weight_dir,
-                step=step,
-                use_collective_rpc=True,
-            )
+            await self._update_weights_via_collective_rpc(weight_dir, step)
             return
         if lora_name is not None or weight_dir is None:
             raise ValueError("Dynamo native integration currently supports full-model NCCL updates only")
@@ -351,6 +315,33 @@ class DynamoInferencePool(InferencePool):
                 return
             await asyncio.sleep(0.1)
         raise TimeoutError(f"Dynamo workers did not commit weight version {expected}; engines remain paused")
+
+    async def _update_weights_via_collective_rpc(self, weight_dir: Path | None, step: int) -> None:
+        if weight_dir is None:
+            raise ValueError("Dynamo collective RPC requires a checkpoint path")
+        clients = self._require_collective_clients()
+        timeout = self._weight_update_timeout
+
+        async def post(client: httpx.AsyncClient, path: str, **kwargs: Any) -> None:
+            response = await client.post(path, timeout=timeout, **kwargs)
+            response.raise_for_status()
+
+        await asyncio.gather(
+            *(post(client, "/pause", params={"mode": "keep", "clear_cache": "false"}) for client in clients)
+        )
+        try:
+            await asyncio.gather(
+                *(
+                    post(
+                        client,
+                        "/collective_rpc",
+                        json={"method": "update_weights_from_path", "args": [weight_dir.as_posix()]},
+                    )
+                    for client in clients
+                )
+            )
+        finally:
+            await asyncio.gather(*(post(client, "/resume") for client in clients))
 
     async def stop(self) -> None:
         await super().stop()
