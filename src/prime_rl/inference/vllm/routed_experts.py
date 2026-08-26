@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -8,7 +9,7 @@ import pybase64
 from vllm.outputs import RequestOutput
 
 
-def serialize_routed_experts(routed_experts: Any, start: int = 0) -> dict[str, Any] | None:
+def serialize_routed_experts(routed_experts: Any, start: int = 0) -> str | None:
     if routed_experts is None:
         return None
 
@@ -25,19 +26,21 @@ def serialize_routed_experts(routed_experts: Any, start: int = 0) -> dict[str, A
             dtype = np.uint16
 
     compact = np.ascontiguousarray(array.astype(dtype, copy=False))
-    return {
+    envelope = {
         "data": pybase64.b64encode(memoryview(compact)).decode("ascii"),
         "shape": list(compact.shape),
         "start": start,
         "dtype": np.dtype(dtype).name,
     }
+    payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    return pybase64.b64encode(payload).decode("ascii")
 
 
 class RoutedExpertsCapture:
     def __init__(self, generator: AsyncIterator[RequestOutput], start: int = 0):
         self._generator = generator
         self._start = start
-        self.routed_experts: dict[int, dict[str, Any]] = {}
+        self.routed_experts: dict[int, str] = {}
 
     async def __aiter__(self):
         async for request_output in self._generator:

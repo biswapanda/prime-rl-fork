@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic_config import ConfigFileError
 
 from prime_rl.configs.env_server import EnvServerConfig
+from prime_rl.configs.evals import EvalsConfig
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import ClientConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli, dump_resolved_config
@@ -23,6 +25,7 @@ CONFIG_CLASSES = [
     OrchestratorConfig,
     InferenceConfig,
     EnvServerConfig,
+    EvalsConfig,
 ]
 
 
@@ -161,6 +164,69 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
 
 
+@pytest.mark.parametrize("config_cls", [TrainerConfig, SFTConfig])
+def test_optimizer_state_offload_keeps_legacy_default(config_cls):
+    config = config_cls.model_validate({})
+
+    assert config.model.optim_cpu_offload is True
+    assert config.model.full_offload is None
+
+
+@pytest.mark.parametrize("config_cls", [TrainerConfig, SFTConfig])
+def test_full_optimizer_offload_disables_gradient_clipping(config_cls):
+    with pytest.warns(UserWarning, match="Gradient clipping prevents optimizer-in-backward"):
+        config = config_cls.model_validate(
+            {
+                "model": {"optim_cpu_offload": False, "full_offload": True},
+                "optim": {"max_norm": 1.0},
+            }
+        )
+
+    assert config.optim.max_norm is None
+
+
+@pytest.mark.parametrize("config_cls", [TrainerConfig, SFTConfig])
+def test_full_optimizer_offload_accepts_debug_backend(config_cls):
+    config = config_cls.model_validate(
+        {
+            "model": {
+                "optim_cpu_offload": False,
+                "full_offload": {
+                    "cpu_optimizer_backend": "torch",
+                },
+            },
+            "optim": {"max_norm": None},
+        }
+    )
+
+    assert config.model.full_offload is not None
+    assert config.model.full_offload.cpu_optimizer_backend == "torch"
+
+
+@pytest.mark.parametrize("config_cls", [TrainerConfig, SFTConfig])
+@pytest.mark.parametrize("optimizer_type", ["sgd", "muon"])
+def test_full_optimizer_offload_requires_supported_optimizer(config_cls, optimizer_type):
+    with pytest.raises(ValidationError, match="Full optimizer offload only supports AdamW and SignSGD"):
+        config_cls.model_validate(
+            {
+                "model": {"optim_cpu_offload": False, "full_offload": True},
+                "optim": {"type": optimizer_type, "max_norm": None},
+            }
+        )
+
+
+@pytest.mark.parametrize("config_cls", [TrainerConfig, SFTConfig])
+def test_full_optimizer_offload_accepts_sign_sgd(config_cls):
+    config = config_cls.model_validate(
+        {
+            "model": {"optim_cpu_offload": False, "full_offload": True},
+            "optim": {"type": "sign_sgd", "max_norm": None},
+        }
+    )
+    assert config.model.full_offload is not None
+    assert config.optim.type == "sign_sgd"
+
+
 def test_resolved_json_roundtrips_explicit_none(tmp_path):
     """An explicit None override survives the write/re-parse round-trip used by launches:
     resolved configs are JSON, which keeps nulls (TOML cannot)."""
@@ -242,6 +308,111 @@ def test_single_node_auto_inference_ports_follow_server_port():
     assert config.inference.vllm.data_parallel_size == 2
     assert config.inference.backend_port == 8101
     assert config.orchestrator.model.client.admin_base_url == ["http://localhost:8101/v1"]
+
+
+def test_external_dynamo_reuses_native_trainer_broadcast():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {
+                "model": {
+                    "client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}},
+                }
+            },
+            "weight_broadcast": {"type": "nccl"},
+            "deployment": {
+                "type": "single_node",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+            },
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.inference_world_size == 1
+    assert config.trainer.weight_broadcast.dynamo is not None
+    assert config.trainer.weight_broadcast.dynamo.discovery_url == "http://dynamo-frontend:8001"
+
+
+def test_external_dynamo_defaults_to_native_nccl():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
+            "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 1},
+        }
+    )
+
+    assert config.weight_broadcast is not None
+    assert config.weight_broadcast.type == "nccl"
+
+
+def test_client_config_identifies_dynamo_with_admin_urls():
+    config = ClientConfig(
+        dynamo={"discovery_url": "http://frontend:8001"},
+        admin_base_url=["http://worker:8000"],
+    )
+
+    assert config.is_dynamo()
+    assert config.dynamo is not None
+    assert config.dynamo.discovery_url == "http://frontend:8001"
+    assert not ClientConfig().is_dynamo()
+
+
+def test_external_dynamo_reuses_nixl_broadcast():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
+            "weight_broadcast": {"type": "nixl", "session_id": "smoke"},
+            "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 1},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "nixl"
+    assert config.trainer.weight_broadcast.inference_world_size == 1
+    assert config.orchestrator.weight_broadcast.type == "nixl"
+    assert config.orchestrator.weight_broadcast.session_id == "smoke"
+
+
+def test_external_dynamo_accepts_filesystem_weight_transfer_for_compatibility():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
+            "weight_broadcast": {"type": "filesystem"},
+            "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 1},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "filesystem"
+    assert config.orchestrator.weight_broadcast.type == "filesystem"
+
+
+def test_external_dynamo_uses_declared_inference_capacity():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
+            "weight_broadcast": {"type": "nixl"},
+            "deployment": {"type": "single_node", "gpus_per_node": 4, "num_train_gpus": 1, "num_infer_gpus": 2},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.inference_world_size == 2
+    assert config.orchestrator.weight_broadcast.inference_world_size == 2
+
+
+def test_external_dynamo_nccl_requires_declared_inference_capacity():
+    with pytest.raises(ValueError, match="num_infer_gpus >= 1"):
+        RLConfig.model_validate(
+            {
+                "trainer": {},
+                "orchestrator": {"model": {"client": {"dynamo": {"discovery_url": "http://dynamo-frontend:8001"}}}},
+                "weight_broadcast": {"type": "nccl"},
+                "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 0},
+            }
+        )
 
 
 def test_multi_node_auto_inference_parallelism():
@@ -493,24 +664,26 @@ def test_trainer_chat_template_cascades_to_inference():
 
 def test_shared_wandb_fields_propagate_to_subconfigs():
     """Every ``SharedWandbConfig`` leaf (project, entity, name, group, tags,
-    offline) propagates to both trainer.wandb and orchestrator.wandb. Regression
-    for a miss in the inline propagator."""
+    offline) propagates to both trainer.monitors.wandb and
+    orchestrator.monitors.wandb. Regression for a miss in the inline propagator."""
     config = RLConfig.model_validate(
         {
             "model": {"name": "Qwen/Qwen3-0.6B"},
-            "wandb": {
-                "project": "shared-proj",
-                "entity": "shared-entity",
-                "name": "shared-name",
-                "group": "shared-group",
-                "tags": ["a", "b"],
-                "offline": False,
+            "monitors": {
+                "wandb": {
+                    "project": "shared-proj",
+                    "entity": "shared-entity",
+                    "name": "shared-name",
+                    "group": "shared-group",
+                    "tags": ["a", "b"],
+                    "offline": False,
+                }
             },
             "trainer": {},
             "orchestrator": {"renderer": {"name": "default"}},
         }
     )
-    for component in (config.trainer.wandb, config.orchestrator.wandb):
+    for component in (config.trainer.monitors.wandb, config.orchestrator.monitors.wandb):
         assert component is not None
         assert component.project == "shared-proj"
         assert component.entity == "shared-entity"
@@ -518,6 +691,24 @@ def test_shared_wandb_fields_propagate_to_subconfigs():
         assert component.group == "shared-group"
         assert component.tags == ["a", "b"]
         assert component.offline is False
+
+
+def test_shared_monitor_disable_and_prime_propagate():
+    """CLI ``--no-monitors.wandb`` / ``--no-monitors.file`` (which land as the string
+    "None") propagate the disable to both sub-configs, whose monitors default to
+    enabled; a shared ``[monitors.prime]`` reaches the orchestrator only."""
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "monitors": {"wandb": "None", "file": "None", "prime": {"name": "shared-prime"}},
+            "trainer": {},
+            "orchestrator": {"renderer": {"name": "default"}},
+        }
+    )
+    assert config.trainer.monitors.wandb is None and config.trainer.monitors.file is None
+    assert config.orchestrator.monitors.wandb is None and config.orchestrator.monitors.file is None
+    assert config.orchestrator.monitors.prime is not None
+    assert config.orchestrator.monitors.prime.name == "shared-prime"
 
 
 def test_empty_shared_ckpt_block_does_not_conflict_with_subconfig_ckpt():
@@ -557,7 +748,7 @@ def test_run_dir_propagates_through_cli(tmp_path):
             "max_steps": 1,
             "seq_len": 128,
             "model": {"name": "Qwen/Qwen3-0.6B"},
-            "wandb": {},
+            "monitors": {"wandb": {}},
             "trainer": {},
             "orchestrator": {"batch_size": 16, "group_size": 1},
             "inference": {},
@@ -569,9 +760,9 @@ def test_run_dir_propagates_through_cli(tmp_path):
     assert config.trainer.output_dir == shared_out / "my-exp"
     assert config.orchestrator.output_dir == shared_out / "my-exp"
     # Unset monitor names inherit run.name
-    assert config.wandb is not None and config.wandb.name == "my-exp"
-    assert config.trainer.wandb is not None and config.trainer.wandb.name == "my-exp"
-    assert config.orchestrator.wandb is not None and config.orchestrator.wandb.name == "my-exp"
+    assert config.monitors.wandb is not None and config.monitors.wandb.name == "my-exp"
+    assert config.trainer.monitors.wandb is not None and config.trainer.monitors.wandb.name == "my-exp"
+    assert config.orchestrator.monitors.wandb is not None and config.orchestrator.monitors.wandb.name == "my-exp"
 
 
 def test_orchestrator_renderer_auto_rejects_unmapped_model():

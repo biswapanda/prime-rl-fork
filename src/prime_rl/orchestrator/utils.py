@@ -6,17 +6,22 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import orjson
+import verifiers.v1 as vf
+from verifiers.v1.episode import EnvInfo
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
-from prime_rl.utils.client import InferencePool
+from prime_rl.utils.client import setup_inference_pool
 from prime_rl.utils.logger import InterceptHandler, get_logger, setup_logger
 from prime_rl.utils.utils import (
     get_broadcast_dir,
     get_ckpt_dir,
     get_step_path,
 )
+
+if TYPE_CHECKING:
+    from prime_rl.orchestrator.types import Rollout
 
 
 async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
@@ -39,25 +44,35 @@ async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
         get_logger().info("Using direct renderer rollout client")
     else:
         get_logger().info("No policy-sourced train env — renderer kept for client-side tokenization only")
-    inference_pool = InferencePool(
+    inference_pool = await setup_inference_pool(
         client_config,
         model_name=model_name,
         train_client_type="renderer",
         eval_client_type="openai_chat_completions",
         renderer_config=config.renderer,
+        inference_world_size=config.weight_broadcast.inference_world_size
+        if config.weight_broadcast.type in ("nccl", "nixl")
+        else None,
     )
     return renderer, inference_pool
 
 
-def save_rollouts(rollouts: list[dict], path: Path) -> None:
-    """Append rollouts (Trace record dicts, already JSON-serializable) to a JSONL file.
-    The trace streams are append-only: ``all`` grows one rollout at a time as they
-    complete, ``effective`` one batch at a time on finalize."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    opts = orjson.OPT_APPEND_NEWLINE | orjson.OPT_SERIALIZE_NUMPY
-    with open(path, "ab") as f:
-        for rollout in rollouts:
-            f.write(orjson.dumps(rollout, default=str, option=opts))
+def group_episodes(rollouts: "list[Rollout]") -> list[vf.Episode]:
+    """Regroup rollouts into their episodes. The dispatcher unwraps every
+    ``vf.Episode`` into its traces on arrival; ``episode_id`` links them back
+    together (a rollout without one forms a single-trace episode)."""
+    groups: dict[str, list] = {}
+    for rollout in rollouts:
+        groups.setdefault(rollout.episode_id or rollout.id, []).append(rollout)
+    return [
+        vf.Episode(
+            id=episode_id,
+            env=EnvInfo(id=group[0].env_name),
+            traces=group,
+            ok=all(trace.ok for trace in group),
+        )
+        for episode_id, group in groups.items()
+    ]
 
 
 def intercept_vf_logging(logger: str = "verifiers", level: str = "DEBUG", prefix: str | None = None):
