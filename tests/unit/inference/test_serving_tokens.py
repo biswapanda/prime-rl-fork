@@ -11,6 +11,7 @@ deltas here:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import numpy as np
 import pybase64
@@ -29,11 +30,12 @@ from prime_rl.inference.vllm.serving_tokens import (
 )
 
 
-def _decode_routed_experts(encoded: dict) -> np.ndarray:
+def _decode_routed_experts(encoded: str) -> np.ndarray:
+    envelope = json.loads(pybase64.b64decode(encoded))
     return np.frombuffer(
-        pybase64.b64decode_as_bytearray(encoded["data"]),
-        dtype=np.uint8,
-    ).reshape(encoded["shape"])
+        pybase64.b64decode_as_bytearray(envelope["data"]),
+        dtype=np.dtype(envelope["dtype"]),
+    ).reshape(envelope["shape"])
 
 
 class _FakeRawRequest:
@@ -71,6 +73,7 @@ def test_serialize_routed_experts_uses_compact_raw_payload():
 
     encoded = serialize_routed_experts(routed_experts)
     assert encoded is not None
+    assert isinstance(encoded, str)
 
     decoded = _decode_routed_experts(encoded)
     assert decoded.dtype == np.uint8
@@ -78,7 +81,7 @@ def test_serialize_routed_experts_uses_compact_raw_payload():
 
 
 def test_generate_response_post_process_replaces_upstream_routed_experts():
-    compact_routed_experts = {"data": "AQID", "shape": [1, 1, 3], "start": 0}
+    compact_routed_experts = "eyJkYXRhIjoiQVFJRCIsInNoYXBlIjpbMSwxLDNdLCJzdGFydCI6MH0="
     capture = _GenerateRoutedExpertsCapture(_empty_request_outputs())
     capture.routed_experts[0] = compact_routed_experts
     response = GenerateResponse(
