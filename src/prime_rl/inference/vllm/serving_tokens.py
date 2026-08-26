@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterable
 from functools import cached_property
-from typing import Any
 
 from fastapi import Request
 from vllm.entrypoints.openai.engine.protocol import (
@@ -51,7 +50,7 @@ from prime_rl.inference.vllm.routed_experts import RoutedExpertsCapture
 
 
 class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
-    routed_experts: dict[str, Any] | None = None
+    routed_experts: str | None = None
 
 
 class PrimeRlGenerateResponse(GenerateResponse):
